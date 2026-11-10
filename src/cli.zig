@@ -575,7 +575,7 @@ pub fn executeCommandInDir(
         var db = try repo_db.RepoDb.loadFromFile(gpa, io, ctx.db_path);
         defer db.deinit();
         var base_cid: ?repo_db.CommitId = null;
-        var start_cid: ?repo_db.CommitId = null;
+        var start_cid: ?repo_db.CommitId = db.branches.items[db.worktrees.items[ctx.wt_id].branch_id].head_commit;
         var max_count: ?usize = null;
         var include_stat = false;
         var json_mode = false;
@@ -588,6 +588,8 @@ pub fn executeCommandInDir(
                 path_filter = arg;
             } else if (std.mem.eql(u8, arg, "--")) {
                 after_dashdash = true;
+            } else if (std.mem.eql(u8, arg, "--all") or std.mem.eql(u8, arg, "-a")) {
+                start_cid = null;
             } else if (std.mem.eql(u8, arg, "--stat")) {
                 include_stat = true;
             } else if (std.mem.eql(u8, arg, "--json")) {

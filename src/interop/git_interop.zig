@@ -42,9 +42,50 @@ pub fn emitFastExportStream(allocator: Allocator, db: *const RepoDb) ![]u8 {
     // Helper offset for commit marks so they never collide with blob marks
     const commit_mark_base: usize = db.blobs.items.len + 1000;
 
-    // 2. Emit all commits starting from `c1` (since `c0` is the synthetic empty root commit)
+    // Mark commits reachable from any branch head or tag in O(C) reverse topological order (INV-2: parent < cid)
+    const reachable = try allocator.alloc(bool, db.commits.items.len);
+    defer allocator.free(reachable);
+    @memset(reachable, false);
+    var any_ref = false;
+    for (db.branches.items) |br| {
+        if (br.head_commit > 0 and br.head_commit < db.commits.items.len) {
+            any_ref = true;
+            reachable[br.head_commit] = true;
+        }
+    }
+    for (db.tags.items) |t| {
+        if (t.target_commit > 0 and t.target_commit < db.commits.items.len) {
+            any_ref = true;
+            reachable[t.target_commit] = true;
+        }
+    }
+    if (any_ref) {
+        var rev_i: usize = db.commits.items.len;
+        while (rev_i > 1) {
+            rev_i -= 1;
+            if (!reachable[rev_i]) continue;
+            const rec = db.commits.items[rev_i];
+            if (rec.parent1) |p1| {
+                if (p1 < db.commits.items.len) reachable[p1] = true;
+            }
+            if (rec.parent2) |p2| {
+                if (p2 < db.commits.items.len) reachable[p2] = true;
+            }
+        }
+    } else {
+        for (1..db.commits.items.len) |i| reachable[i] = true;
+    }
+
+    // 2. Emit all reachable commits starting from `c1` (since `c0` is the synthetic empty root commit)
+    var emitted_root = false;
     for (db.commits.items, 0..) |c, cid| {
-        if (cid == 0) continue;
+        if (cid == 0 or !reachable[cid]) continue;
+        if (c.parent1 == null or c.parent1.? == 0) {
+            if (emitted_root) {
+                try out.appendSlice(allocator, "reset refs/heads/main\n\n");
+            }
+            emitted_root = true;
+        }
 
         const c_mark = commit_mark_base + cid;
         const committer_ident = try formatFastExportIdentAlloc(allocator, c.author);
@@ -217,7 +258,7 @@ pub fn importFastExportStream(allocator: Allocator, db: *RepoDb, stream: []const
 
             var mark_id: ?u64 = null;
             var author_name: []const u8 = "git-user";
-            var commit_ts: i64 = 1700000000;
+            var commit_ts: i64 = repo_db.currentUnixTimestampSec();
             var message: []const u8 = "";
             var parent1_cid: ?CommitId = null;
             var parent2_cid: ?CommitId = null;

@@ -52,13 +52,44 @@ pub const CommitRecord = struct {
     root_tree_id: TreeId,
     author: []u8,
     message: []u8,
-    timestamp_sec: i64 = 1700000000,
+    timestamp_sec: i64 = 0,
 
     pub fn deinit(self: *CommitRecord, allocator: Allocator) void {
         allocator.free(self.author);
         allocator.free(self.message);
     }
 };
+
+/// Returns the current real-world Unix epoch timestamp in seconds via `clock_gettime(.REALTIME)`.
+pub fn currentUnixTimestampSec() i64 {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
+        .SUCCESS => return @intCast(ts.sec),
+        else => return 0,
+    }
+}
+
+/// Formats a Unix epoch timestamp (in seconds) as `YYYY-MM-DD HH:MM:SS UTC`.
+pub fn formatTimestampUtcBuf(timestamp_sec: i64, buf: *[23]u8) []const u8 {
+    const secs: u64 = if (timestamp_sec > 0) @intCast(timestamp_sec) else 0;
+    const epoch_secs = std.time.epoch.EpochSeconds{ .secs = secs };
+    const epoch_day = epoch_secs.getEpochDay();
+    const day_secs = epoch_secs.getDaySeconds();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    return std.fmt.bufPrint(
+        buf,
+        "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} UTC",
+        .{
+            year_day.year,
+            month_day.month.numeric(),
+            @as(u8, month_day.day_index) + 1,
+            day_secs.getHoursIntoDay(),
+            day_secs.getMinutesIntoHour(),
+            day_secs.getSecondsIntoMinute(),
+        },
+    ) catch "1970-01-01 00:00:00 UTC";
+}
 
 pub const BranchRecord = struct {
     id: BranchId,
@@ -380,8 +411,20 @@ pub const RepoDb = struct {
         message: []const u8,
     ) !CommitId {
         const cid: CommitId = @intCast(self.commits.items.len);
-        const default_ts: i64 = 1700000000 + @as(i64, @intCast(cid));
-        return self.appendCommitWithTimestamp(parent1, parent2, root_tree_id, author, message, default_ts);
+        var ts: i64 = if (cid == 0) 0 else currentUnixTimestampSec();
+        if (cid > 0) {
+            if (parent1) |p1| {
+                if (p1 < self.commits.items.len) {
+                    ts = @max(ts, self.commits.items[p1].timestamp_sec);
+                }
+            }
+            if (parent2) |p2| {
+                if (p2 < self.commits.items.len) {
+                    ts = @max(ts, self.commits.items[p2].timestamp_sec);
+                }
+            }
+        }
+        return self.appendCommitWithTimestamp(parent1, parent2, root_tree_id, author, message, ts);
     }
 
     pub fn appendCommitWithTimestamp(
@@ -1850,12 +1893,17 @@ pub const RepoDb = struct {
             const m_copy = try self.allocator.dupe(u8, rec.message);
             defer self.allocator.free(m_copy);
 
-            const new_cid = try self.appendCommit(
+            const cascaded_ts: i64 = if (rec.timestamp_sec >= 1700000000 and rec.timestamp_sec < 1700010000)
+                currentUnixTimestampSec()
+            else
+                rec.timestamp_sec;
+            const new_cid = try self.appendCommitWithTimestamp(
                 mapped_p1 orelse rec.parent1,
                 mapped_p2 orelse rec.parent2,
                 cascaded_tid,
                 a_copy,
                 m_copy,
+                cascaded_ts,
             );
             try remap.put(cid, new_cid);
         }
@@ -2558,7 +2606,9 @@ pub const RepoDb = struct {
             } else {
                 try out.print(allocator, " [root]{s}\n", .{conf_tag});
             }
-            try out.print(allocator, "| Author: {s}\n|     {s}\n|\n", .{ c.author, c.message });
+            var date_buf: [23]u8 = undefined;
+            const date_str = formatTimestampUtcBuf(c.timestamp_sec, &date_buf);
+            try out.print(allocator, "| Author: {s}\n| Date:   {s}\n|     {s}\n|\n", .{ c.author, date_str, c.message });
         }
 
         return out.toOwnedSlice(allocator);
@@ -2616,6 +2666,11 @@ pub const RepoDb = struct {
                 }
             }
             if (found_local) |existing_cid| {
+                if (self.commits.items[existing_cid].timestamp_sec != remote.commits.items[rc_idx].timestamp_sec and
+                    remote.commits.items[rc_idx].timestamp_sec >= 1700010000)
+                {
+                    self.commits.items[existing_cid].timestamp_sec = remote.commits.items[rc_idx].timestamp_sec;
+                }
                 remote_to_local_commit[rc_idx] = existing_cid;
             } else {
                 const rc = remote.commits.items[rc_idx];
@@ -2849,10 +2904,12 @@ pub const RepoDb = struct {
 
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
+        var date_buf: [23]u8 = undefined;
+        const date_str = formatTimestampUtcBuf(c.timestamp_sec, &date_buf);
         try out.print(
             allocator,
-            "commit c{d}\nAuthor: {s}\nTimestamp: {d}\n\n    {s}\n\n{s}",
-            .{ c.id, c.author, c.timestamp_sec, c.message, diff_txt },
+            "commit c{d}\nAuthor: {s}\nDate:   {s} ({d})\n\n    {s}\n\n{s}",
+            .{ c.id, c.author, date_str, c.timestamp_sec, c.message, diff_txt },
         );
         return out.toOwnedSlice(allocator);
     }
@@ -3319,7 +3376,9 @@ pub const RepoDb = struct {
             } else {
                 try out.print(allocator, " [root]{s}\n", .{conf_tag});
             }
-            try out.print(allocator, "| Author: {s}\n|     {s}\n", .{ c.author, c.message });
+            var date_buf: [23]u8 = undefined;
+            const date_str = formatTimestampUtcBuf(c.timestamp_sec, &date_buf);
+            try out.print(allocator, "| Author: {s}\n| Date:   {s}\n|     {s}\n", .{ c.author, date_str, c.message });
             if (include_stat and c.id > 0) {
                 const parent_cid = c.parent1 orelse 0;
                 const stat_txt = try self.formatDiffStat(allocator, self.commits.items[parent_cid].root_tree_id, c.root_tree_id);
@@ -3732,7 +3791,9 @@ pub const RepoDb = struct {
             } else {
                 try out.print(allocator, " [root]{s}\n", .{conf_tag});
             }
-            try out.print(allocator, "| Author: {s}\n|     {s}\n", .{ c.author, c.message });
+            var date_buf: [23]u8 = undefined;
+            const date_str = formatTimestampUtcBuf(c.timestamp_sec, &date_buf);
+            try out.print(allocator, "| Author: {s}\n| Date:   {s}\n|     {s}\n", .{ c.author, date_str, c.message });
             if (include_stat and c.id > 0) {
                 const parent_cid = c.parent1 orelse 0;
                 const stat_txt = try self.formatDiffStat(allocator, self.commits.items[parent_cid].root_tree_id, c.root_tree_id);
@@ -4244,12 +4305,17 @@ pub const RepoDb = struct {
             const m_copy = try self.allocator.dupe(u8, rec.message);
             defer self.allocator.free(m_copy);
 
-            const new_cid = try self.appendCommit(
+            const cascaded_ts: i64 = if (rec.timestamp_sec >= 1700000000 and rec.timestamp_sec < 1700010000)
+                currentUnixTimestampSec()
+            else
+                rec.timestamp_sec;
+            const new_cid = try self.appendCommitWithTimestamp(
                 mapped_p1 orelse rec.parent1,
                 mapped_p2 orelse rec.parent2,
                 cascaded_tid,
                 a_copy,
                 m_copy,
+                cascaded_ts,
             );
             try remap.put(cid, new_cid);
         }
