@@ -491,7 +491,19 @@ fn extractBranchName(ref_name: []const u8) []const u8 {
 
 fn parsePersonName(s: []const u8) []const u8 {
     if (std.mem.indexOfScalar(u8, s, '<')) |lt_idx| {
-        return std.mem.trim(u8, s[0..lt_idx], " ");
+        const name_only = std.mem.trim(u8, s[0..lt_idx], " ");
+        if (std.mem.indexOfScalarPos(u8, s, lt_idx, '>')) |gt_idx| {
+            const email = s[lt_idx + 1 .. gt_idx];
+            const suffix = "@zig-vcs.local";
+            if (std.mem.endsWith(u8, email, suffix)) {
+                const local_part = email[0 .. email.len - suffix.len];
+                if (std.mem.eql(u8, local_part, name_only) or std.mem.eql(u8, local_part, "user")) {
+                    return name_only;
+                }
+            }
+            return std.mem.trim(u8, s[0 .. gt_idx + 1], " ");
+        }
+        return name_only;
     }
     return s;
 }
