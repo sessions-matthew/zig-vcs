@@ -190,6 +190,12 @@ Every subsystem and formal proof in `zig-vcs` is grounded in peer-reviewed versi
 
 ---
 
+## Acknowledgments
+
+Built with **Gemini** in **Google Antigravity**.
+
+---
+
 ## License
 
 Released under the [MIT License](LICENSE).
