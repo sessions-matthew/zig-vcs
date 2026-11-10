@@ -47,10 +47,12 @@ pub fn emitFastExportStream(allocator: Allocator, db: *const RepoDb) ![]u8 {
         if (cid == 0) continue;
 
         const c_mark = commit_mark_base + cid;
+        const committer_ident = try formatFastExportIdentAlloc(allocator, c.author);
+        defer allocator.free(committer_ident);
         const hdr = try std.fmt.allocPrint(
             allocator,
-            "commit refs/heads/main\nmark :{d}\ncommitter {s} <{s}@zig-vcs.local> {d} +0000\ndata {d}\n{s}\n",
-            .{ c_mark, c.author, c.author, c.timestamp_sec, c.message.len, c.message },
+            "commit refs/heads/main\nmark :{d}\ncommitter {s} {d} +0000\ndata {d}\n{s}\n",
+            .{ c_mark, committer_ident, c.timestamp_sec, c.message.len, c.message },
         );
         defer allocator.free(hdr);
         try out.appendSlice(allocator, hdr);
@@ -158,6 +160,23 @@ fn findBlobMark(db: *const RepoDb, hash: ArtifactHash) ?usize {
         if (tree_sum.hashEql(b.hash, hash)) return idx + 1;
     }
     return null;
+}
+
+fn formatFastExportIdentAlloc(allocator: Allocator, author: []const u8) ![]u8 {
+    if (std.mem.indexOfScalar(u8, author, '<') != null and std.mem.indexOfScalar(u8, author, '>') != null) {
+        return allocator.dupe(u8, author);
+    }
+    var has_space = false;
+    for (author) |ch| {
+        if (ch == ' ' or ch == '\t' or ch == '<' or ch == '>') {
+            has_space = true;
+            break;
+        }
+    }
+    if (!has_space and author.len > 0) {
+        return std.fmt.allocPrint(allocator, "{s} <{s}@zig-vcs.local>", .{ author, author });
+    }
+    return std.fmt.allocPrint(allocator, "{s} <user@zig-vcs.local>", .{if (author.len > 0) author else "user"});
 }
 
 /// Parse a `git fast-export` stream into `db`, populating blobs, trees, commits, and branches!
