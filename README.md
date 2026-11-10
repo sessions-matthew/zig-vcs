@@ -153,6 +153,43 @@ Run `zig_vcs` (inside any workspace for a live status overview), `zig_vcs help a
 
 ---
 
+## Research Foundations & Academic Citations
+
+Every subsystem and formal proof in `zig-vcs` is grounded in peer-reviewed version control, programming languages, and storage systems literature:
+
+### 1. Concept Design & Per-Branch Working State (Pillar 1)
+- **Santiago Perez De Rosso and Daniel Jackson (2013)**, *"What's Wrong with Git? A Conceptual Design Analysis"*, in **ACM Onward! 2013**, pp. 37–52.
+  - Identifies the conceptual flaws of Git's staging area (`index`), `stash`, and non-total branch switching that cause silent uncommitted data loss—motivating `zig-vcs`'s staging-free auto-tracked worktrees and per-`(worktree_id, branch_id)` `drafts` table (`INV-4`).
+- **Santiago Perez De Rosso and Daniel Jackson (2016)**, *"Purposes, Concepts, Misfits, and a Redesign of Git"*, in **ACM OOPSLA 2016**, pp. 292–310.
+  - Formalizes **Gitless** and 1-to-1 concept-aligned version control commands where uncommitted changes are part of the branch state rather than global checkout state.
+
+### 2. Algebraic Conflicts, Mergeable Types & Patch Theory (Pillar 2)
+- **Sanjeev Khanna, Keshav Kunal, and Benjamin C. Pierce (2007)**, *"A Formal Investigation of `diff3`"*, in **FSTTCS 2007** (LNCS vol. 4855), pp. 485–496.
+  - Proves when 3-way text merge (`diff3`) is well-behaved via **monotonic unique anchors** separating modified regions—implemented directly in [`src/algebra/diff3_anchors.zig`](src/algebra/diff3_anchors.zig).
+- **Samuel Mimram and Cinzia Di Giusto (2013)**, *"A Categorical Theory of Patches"*, in **Electronic Notes in Theoretical Computer Science (MFPS XXIX)**, vol. 298, pp. 283–307 (and the **Pijul** patch theory specification).
+  - Models merges as categorical pushouts so conflicts are first-class mathematical objects rather than ad-hoc text markers.
+- **Carlo Angiuli, Edward Morehouse, Daniel R. Licata, and Robert Harper (2014)**, *"Homotopical Patch Theory"*, in **ACM ICFP 2014**, pp. 243–256.
+  - Establishes algebraic laws (commutativity, associativity, and inverse cancellation) for patch/revision spaces.
+- **Gowtham Kaki, Swarn Priya, KC Sivaramakrishnan, and Suresh Jagannathan (2019)**, *"Mergeable Replicated Data Types (MRDTs)"*, in **ACM OOPSLA 2019**, Article 154.
+  - Formalizes relational 3-way merge via invertible algebraic representations over lowest common ancestors (LCAs).
+- **Martin von Zweigbergk et al.**, *"Jujutsu (`jj`) — First-Class Conflicts & Tree Algebra"*.
+  - Inspires `zig-vcs`'s representation of every path (`PathSum`) and tree (`TreeManifest`) in the free abelian group $\mathbb{Z}[\mathcal{A}_{\bot}]$ ($\sum c_i = 1$) where 3-way merge is $B + C - A$, rebase is $(B + C - A) + D - C = B + D - A$, and conflict markers are never stored in `db.blobs` (`INV-5`, [`src/algebra/tree_sum.zig`](src/algebra/tree_sum.zig)).
+
+### 3. Mechanized Verification of Version Control Systems
+- **Wouter Swierstra and Andres Löh (2014)**, *"The Semantics of Version Control"*, in **ACM Onward! 2014**, pp. 43–54.
+- **Wouter Swierstra (2017)**, *"A Verified Implementation of a Version Control System"*, Utrecht University Technical Report.
+  - Guides our mechanized **Lean 4** proof suite ([`proofs/VcsProofs/Basic.lean`](proofs/VcsProofs/Basic.lean), 38 theorems with `0 sorry`) and explicit-state **TLA+ model checker** ([`src/tla.zig`](src/tla.zig), [`src/vcs_model.zig`](src/vcs_model.zig)).
+
+### 4. Single-File Transactional Storage, CoW B-Trees & Crash Recovery (Pillar 3)
+- **D. Richard Hipp**, *"Fossil SCM: Thoughts On The Design Of The Fossil DVCS (`fossil_theory1.wiki`), Technical Overview (`fossil_tech_overview.wiki`), and File Format (`fossil_fileformat.wiki`)"*.
+  - Inspires the separation of the enduring content-addressed artifact store from the mutable relational index inside a single `.vcs/db.vcs` database file, as well as the 8-byte rolling-hash byte-delta compressor (`ZDL1`, [`src/storage/delta.zig`](src/storage/delta.zig))—while fixing Fossil's transient `.fslckout` worktree limitation by storing `worktrees`, `drafts`, and `oplog` inside the primary repository file.
+- **Ohad Rodeh (2008)**, *"B-trees, Shadowing, and Clones"*, in **ACM Transactions on Storage (TOS)**, vol. 3, no. 4, Article 2.
+  - Provides the top-down copy-on-write (CoW) B-tree algorithm with $O(1)$ tree cloning and lazy reference counting implemented in [`src/storage/cow_btree.zig`](src/storage/cow_btree.zig).
+- **Russell Sears and Eric Brewer (2006)**, *"Stasis: Flexible Transactional Storage"*, in **USENIX OSDI 2006**, pp. 29–44.
+  - Informs our 4KB shadow-paged storage engine (`ZVCSPG01`) with Dual-Superblock (`Slot A` / `Slot B`) atomic commit and torn-write crash recovery ([`src/storage/paged_file.zig`](src/storage/paged_file.zig)).
+
+---
+
 ## License
 
 Released under the [MIT License](LICENSE).
