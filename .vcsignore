@@ -1,0 +1,15 @@
+# Zig build & cache directories (also built-in)
+zig-out/
+.zig-cache/
+
+# Lean 4 Lake build cache
+.lake/
+proofs/.lake/
+
+# Read-only reference vendor trees & research corpus
+/ref/
+
+# OS & temporary files
+.DS_Store
+*.tmp
+*.swp

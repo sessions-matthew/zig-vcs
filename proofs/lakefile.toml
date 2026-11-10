@@ -1,0 +1,6 @@
+name = "vcs_proofs"
+version = "0.1.0"
+defaultTargets = ["VcsProofs"]
+
+[[lean_lib]]
+name = "VcsProofs"
