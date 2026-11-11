@@ -404,6 +404,7 @@ pub const PendingActionKind = enum(u8) {
     preview_oplog_jump = 21,
     restore_oplog = 22,
     cancel_oplog_preview = 23,
+    toggle_visual_dag = 24,
 };
 
 pub const ZigVcsPluginState = struct {
@@ -412,6 +413,7 @@ pub const ZigVcsPluginState = struct {
     has_git_dir: bool = false,
     show_git_fallback_mode: bool = false,
     math_mode: bool = false,
+    show_visual_dag: bool = true,
     last_db_mtime_ns: i96 = -1,
 
     // Deferred action queue (guarantees Pass.input == Pass.paint layout determinism)
@@ -602,6 +604,34 @@ const Ctx = struct {
             accent_kind,
         );
         return @bitCast(bits);
+    }
+
+    fn listItemAction2(
+        self: *Ctx,
+        lbl: []const u8,
+        meta: []const u8,
+        icon_text: []const u8,
+        accent_kind: u8,
+        selected: bool,
+        action_label: []const u8,
+        secondary_label: []const u8,
+    ) ListItemResultFlags {
+        const bits = self.api.ui.list_item_ex(
+            self.host,
+            AbiSlice.fromZig(lbl),
+            AbiSlice.fromZig(meta),
+            AbiSlice.fromZig(icon_text),
+            AbiSlice.fromZig(action_label),
+            AbiSlice.fromZig(secondary_label),
+            0,
+            selected,
+            accent_kind,
+        );
+        return @bitCast(bits);
+    }
+
+    fn markdown(self: *Ctx, md_src: []const u8) void {
+        self.api.ui.markdown(self.host, AbiSlice.fromZig(md_src));
     }
 
     fn textField(self: *Ctx, id: []const u8, str: anytype, placeholder: []const u8) TextFieldResultFlags {
@@ -1338,11 +1368,53 @@ fn applyPendingMutations(ctx: *Ctx, st: *ZigVcsPluginState) void {
         .cancel_oplog_preview => {
             st.oplog_preview_active = false;
         },
+        .toggle_visual_dag => {
+            st.show_visual_dag = !st.show_visual_dag;
+        },
     }
+}
+
+fn buildVisualDagMarkdown(ctx: *Ctx, st: *ZigVcsPluginState) []const u8 {
+    var out = std.ArrayList(u8).empty;
+    const a = ctx.alloc();
+
+    out.appendSlice(a, ctx.fmt("> [!TIP] **Algebraic DAG & Worktree Topology** — `@{s}` on `{s}` (`c{d}`) · `{s}`\n\n", .{
+        st.current_worktree.slice(),
+        st.current_branch.slice(),
+        st.head_commit,
+        st.bridge_pill.slice(),
+    })) catch {};
+
+    out.appendSlice(a, "```text\n") catch {};
+    for (st.commits[0..@min(st.commit_count, 8)], 0..) |c, idx| {
+        var tz_buf: [5]u8 = undefined;
+        const tz_str = repo_db.formatTzOffsetBuf(c.tz_offset_min, &tz_buf);
+        const head_tag = if (c.id == st.head_commit) " (@HEAD)" else "";
+        const lock_tag = if (c.is_locked_git) " [locked]" else "";
+        const conf_tag = if (c.has_conflicts) " [⚡ Z[A_bot] conflict]" else "";
+        if (c.parent2 > 0) {
+            out.appendSlice(a, ctx.fmt("├─● c{d}{s}{s}{s}  (merge: c{d} + c{d} - base) [{s}] {s}\n", .{
+                c.id, head_tag, lock_tag, conf_tag, c.parent1, c.parent2, tz_str, c.subject.slice(),
+            })) catch {};
+            out.appendSlice(a, "│ ├─╮\n") catch {};
+        } else {
+            const node = if (c.id == st.head_commit) "◉" else "●";
+            out.appendSlice(a, ctx.fmt("{s} c{d}{s}{s}{s} ← c{d} [{s}]  {s}\n", .{
+                node, c.id, head_tag, lock_tag, conf_tag, c.parent1, tz_str, c.subject.slice(),
+            })) catch {};
+            if (idx + 1 < @min(st.commit_count, 8)) {
+                out.appendSlice(a, "│\n") catch {};
+            }
+        }
+    }
+    out.appendSlice(a, "```\n") catch {};
+    return out.items;
 }
 
 fn registerCommands(ctx: *Ctx) void {
     _ = ctx.api.register_command(ctx.host, AbiSlice.fromZig("zig_vcs.refresh"), AbiSlice.fromZig("zig-vcs: Sync & Refresh Repository State"), AbiSlice.fromZig("zig-vcs"), AbiSlice.fromZig("ZVCS"));
+    _ = ctx.api.register_command(ctx.host, AbiSlice.fromZig("zig_vcs.open_diff"), AbiSlice.fromZig("zig-vcs: Open Workspace Unified/Split Diff Viewer"), AbiSlice.fromZig("zig-vcs"), AbiSlice.fromZig("Diff"));
+    _ = ctx.api.register_command(ctx.host, AbiSlice.fromZig("zig_vcs.open_graph"), AbiSlice.fromZig("zig-vcs: Open Visual Commit DAG & Oplog Graph Panel"), AbiSlice.fromZig("zig-vcs"), AbiSlice.fromZig("Graph"));
     _ = ctx.api.register_command(ctx.host, AbiSlice.fromZig("zig_vcs.commit"), AbiSlice.fromZig("zig-vcs: Commit Checked Files"), AbiSlice.fromZig("zig-vcs"), AbiSlice.fromZig("Cmd+Enter"));
     _ = ctx.api.register_command(ctx.host, AbiSlice.fromZig("zig_vcs.undo"), AbiSlice.fromZig("zig-vcs: Atomic O(1) Undo Last Operation"), AbiSlice.fromZig("zig-vcs"), AbiSlice.fromZig("Undo"));
     _ = ctx.api.register_command(ctx.host, AbiSlice.fromZig("zig_vcs.redo"), AbiSlice.fromZig("zig-vcs: Atomic O(1) Redo Operation"), AbiSlice.fromZig("zig-vcs"), AbiSlice.fromZig("Redo"));
@@ -1379,6 +1451,11 @@ fn onCommand(host: *anyopaque, api: *const EditorHostApiV1, cmd_id_abi: AbiSlice
         ctx.api.sync_workspace_git(ctx.host, true, false);
         refreshFromRepoDb(st, true);
         ctx.setNotice("zig-vcs: Synchronized worktree with .vcs/db.vcs");
+    } else if (std.mem.eql(u8, cmd, "zig_vcs.open_diff")) {
+        const rev = if (st.file_count > 0) "" else ctx.fmt("c{d}", .{st.head_commit});
+        ctx.api.open_git_diff(ctx.host, AbiSlice.fromZig(""), AbiSlice.fromZig(rev), false, false);
+    } else if (std.mem.eql(u8, cmd, "zig_vcs.open_graph")) {
+        ctx.api.toggle_bottom_panel(ctx.host);
     } else if (std.mem.eql(u8, cmd, "zig_vcs.commit")) {
         performCommitChecked(&ctx, st);
     } else if (std.mem.eql(u8, cmd, "zig_vcs.undo")) {
@@ -1414,8 +1491,36 @@ fn renderStatusBar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) v
         ctx.fmt("zvcs: @{s} (c{d} · ✓)##zvcs_sb", .{ st.current_branch.slice(), st.head_commit });
 
     if (ctx.chip(chip_lbl, conflict_count == 0)) {
+        const rev = if (st.file_count > 0) "" else ctx.fmt("c{d}", .{st.head_commit});
+        ctx.api.open_git_diff(ctx.host, AbiSlice.fromZig(""), AbiSlice.fromZig(rev), false, false);
         st.schedule(&ctx, .sync_refresh, 0, 0, 0);
     }
+}
+
+fn renderBottomPanel(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) void {
+    var ctx = Ctx{ .host = host, .api = api };
+    const st = ctx.state();
+    if (ctx.isInputPass() and !st.initialized) {
+        refreshFromRepoDb(st, false);
+    }
+    if (!st.has_zvcs_db) {
+        ctx.mutedLabel("No .vcs/db.vcs found in workspace.");
+        return;
+    }
+
+    ctx.beginRow(26, 6);
+    if (ctx.button("Open Latest Commit Diff##zvcs_bp_diff_head", 156, 24)) {
+        ctx.api.open_git_diff(ctx.host, AbiSlice.fromZig(""), AbiSlice.fromZig(ctx.fmt("c{d}", .{st.head_commit})), false, false);
+    }
+    if (ctx.button("Open Working Tree Diff##zvcs_bp_diff_wt", 148, 24)) {
+        ctx.api.open_git_diff(ctx.host, AbiSlice.fromZig(""), AbiSlice.fromZig(""), false, false);
+    }
+    if (ctx.button("Open Interactive HTML Report##zvcs_bp_html", 178, 24)) {
+        ctx.api.run_terminal_command(ctx.host, AbiSlice.fromZig("open vcs_verification_report.html"));
+    }
+    ctx.endBox();
+
+    ctx.markdown(buildVisualDagMarkdown(&ctx, st));
 }
 
 fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) void {
@@ -1451,6 +1556,20 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
         return;
     }
 
+    // Quick Diff & Visual Graph Toolbar
+    ctx.beginRow(26, 6);
+    if (ctx.button(if (st.file_count > 0) "Open Diff (Working)##zvcs_open_wt_diff" else ctx.fmt("Open Diff (c{d})##zvcs_open_wt_diff", .{st.head_commit}), 132, 22)) {
+        const rev = if (st.file_count > 0) "" else ctx.fmt("c{d}", .{st.head_commit});
+        ctx.api.open_git_diff(ctx.host, AbiSlice.fromZig(""), AbiSlice.fromZig(rev), false, false);
+    }
+    if (ctx.button(if (st.show_visual_dag) "Hide Graph ▴##zvcs_vis_dag" else "Visual Graph ▾##zvcs_vis_dag", 98, 22)) {
+        st.schedule(&ctx, .toggle_visual_dag, 0, 0, 0);
+    }
+    if (ctx.button("HTML DAG##zvcs_html_dag", 68, 22)) {
+        ctx.api.run_terminal_command(ctx.host, AbiSlice.fromZig("open vcs_verification_report.html"));
+    }
+    ctx.endBox();
+
     // Refinement 4: Live Git Sync Bridge Health Pill
     ctx.beginRow(24, 6);
     _ = ctx.chip(ctx.fmt("{s}##zvcs_bridge_pill", .{st.bridge_pill.slice()}), st.bridge_can_export);
@@ -1468,6 +1587,11 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
 
     if (st.last_action_status.slice().len > 0) {
         ctx.monoLabel(st.last_action_status.slice());
+    }
+
+    if (st.show_visual_dag) {
+        ctx.divider();
+        ctx.markdown(buildVisualDagMarkdown(&ctx, st));
     }
 
     // Refinement 1c: Auto-Shelved Draft Toast on 1-Click Branch Switch
@@ -1559,31 +1683,30 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
                 .modified => AccentAmber,
             };
             const item_lbl = ctx.fmt("{s} {s}", .{ check_glyph, f.path.slice() });
-            const action_lbl = if (f.has_conflict)
-                "Resolve ▾"
-            else if (f.line_count > 1)
-                (if (f.expanded_hunks) "Lines ▴" else "Lines ▾")
+            const sec_lbl = if (f.line_count > 1)
+                (if (f.expanded_hunks) "Lines▴" else "Lines▾")
             else
-                "Diff";
+                "Open";
 
-            const row = ctx.listItemAction(
+            const row = ctx.listItemAction2(
                 item_lbl,
                 badge,
                 if (f.has_conflict) "⚡" else "●",
                 accent,
                 f.checked,
-                action_lbl,
+                "Diff",
+                sec_lbl,
             );
             if (row.clicked) {
                 st.schedule(&ctx, .toggle_file_checked, f_idx, 0, 0);
             } else if (row.action_clicked) {
-                if (f.line_count > 1 or f.has_conflict) {
+                ctx.api.open_git_diff(ctx.host, AbiSlice.fromZig(f.path.slice()), AbiSlice.fromZig(""), false, false);
+            } else if (row.secondary_action_clicked) {
+                if (f.line_count > 1) {
                     st.schedule(&ctx, .toggle_file_hunks, f_idx, 0, 0);
                 } else {
-                    ctx.api.open_git_diff(ctx.host, AbiSlice.fromZig(f.path.slice()), AbiSlice.fromZig(""), false, false);
+                    _ = ctx.api.open_file_path(ctx.host, AbiSlice.fromZig(f.path.slice()));
                 }
-            } else if (row.secondary_action_clicked) {
-                _ = ctx.api.open_file_path(ctx.host, AbiSlice.fromZig(f.path.slice()));
             }
 
             // Refinement 2a & 2b: 2-Pane Conflict Delta Inspector & Human-First Provenance Labels
@@ -1629,7 +1752,7 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
     // ========================================================================
     // Commit Graph (`log`) + Immutable Lock Glyphs + Amend Cascade Dry-Run
     // ========================================================================
-    ctx.sectionLabel("COMMIT DAG (LOCAL TIME ±HHMM & CASCADE)");
+    ctx.sectionLabel("COMMIT DAG (CLICK FOR DIFF & CASCADE)");
 
     for (st.commits[0..st.commit_count], 0..) |c, c_i| {
         ctx.pushId(ctx.fmt("cm_{d}", .{c_i}));
@@ -1637,7 +1760,8 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
         const tz_str = repo_db.formatTzOffsetBuf(c.tz_offset_min, &tz_buf);
         const lock_prefix = if (c.is_locked_git) "🔒 " else "";
         const conflict_suffix = if (c.has_conflicts) " ⚡" else "";
-        const lbl = ctx.fmt("{s}c{d}{s}  {s}", .{ lock_prefix, c.id, conflict_suffix, c.subject.slice() });
+        const rail = if (c.parent2 > 0) "├─● " else if (c.id == st.head_commit) "◉─ " else "│ ● ";
+        const lbl = ctx.fmt("{s}{s}c{d}{s}  {s}", .{ rail, lock_prefix, c.id, conflict_suffix, c.subject.slice() });
         const meta = ctx.fmt("{s}", .{tz_str});
         const is_sel = (st.selected_commit_id == c.id);
 
@@ -1647,9 +1771,10 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
             if (c.id == st.head_commit) "@" else "●",
             if (c.has_conflicts) AccentAmber else if (c.id == st.head_commit) AccentEmerald else AccentNone,
             is_sel,
-            "Inspect",
+            "Diff",
         );
         if (row.clicked or row.action_clicked) {
+            ctx.api.open_git_diff(ctx.host, AbiSlice.fromZig(""), AbiSlice.fromZig(ctx.fmt("c{d}", .{c.id})), false, false);
             st.schedule(&ctx, .select_commit, c_i, 0, c.id);
         }
 
@@ -1786,16 +1911,19 @@ pub const PLUGIN_DESCRIPTOR = EditorPluginV1{
             .commands = true,
             .buffer_hooks = true,
             .sidebar_panel = true,
+            .bottom_panel = true,
             .status_bar = true,
         },
         .sidebar_icon = .git,
         .sidebar_title = AbiSlice.fromZig("ZIG-VCS SOURCE CONTROL"),
+        .bottom_tab_title = AbiSlice.fromZig("ZIG-VCS GRAPH"),
     },
     .init = &onInit,
     .on_reload = &onReload,
     .on_command = &onCommand,
     .on_buffer_save = &onBufferSave,
     .render_sidebar = &renderSidebar,
+    .render_bottom_panel = &renderBottomPanel,
     .render_status_bar = &renderStatusBar,
 };
 
@@ -1813,6 +1941,7 @@ test "LightningVcsPlugin: C-ABI descriptor & state size conformance" {
     try std.testing.expectEqualStrings("zig_vcs.source_control", desc.manifest.id.toZig());
     try std.testing.expectEqual(PluginSidebarIcon.git, desc.manifest.sidebar_icon);
     try std.testing.expect(desc.manifest.capabilities.sidebar_panel);
+    try std.testing.expect(desc.manifest.capabilities.bottom_panel);
     try std.testing.expect(desc.manifest.capabilities.status_bar);
     try std.testing.expect(desc.manifest.capabilities.commands);
     try std.testing.expect(@sizeOf(ZigVcsPluginState) <= 24576);
