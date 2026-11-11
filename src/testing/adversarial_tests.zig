@@ -1392,6 +1392,15 @@ test "Adversarial 34: Commit timestamp persistence (ZIGVCS02 + git-interop) and 
     try db.editFile(0, "app.zig", "v1\n");
     const c1 = try db.commitWorktree(0, "alice", "c1: base");
     db.commits.items[c1].timestamp_sec = 1731096000;
+    db.commits.items[c1].tz_offset_min = -480; // -0800 PST
+
+    var fmt_buf: [25]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "2024-11-08 12:00:00 -0800",
+        repo_db.formatTimestampWithOffsetBuf(1731096000, -480, &fmt_buf),
+    );
+    try std.testing.expectEqual(@as(?i16, -480), repo_db.parseTzOffsetMin("-0800"));
+    try std.testing.expectEqual(@as(?i16, 330), repo_db.parseTzOffsetMin("+05:30"));
 
     // 1. Create branch `feature-old`, switch to it, make a dirty draft, then switch back to `main`
     _ = try db.switchBranch(0, "feature-old");
@@ -1413,19 +1422,22 @@ test "Adversarial 34: Commit timestamp persistence (ZIGVCS02 + git-interop) and 
     const feat_br = db.findBranchByName("feature-new").?;
     try std.testing.expect(db.getDraft(0, feat_br) != null);
 
-    // 5. Verify commit timestamp round-trips across `ZIGVCS02` and `git fast-export`/`import`
+    // 5. Verify commit timestamp & timezone offset round-trip across `ZIGVCS02` and `git fast-export`/`import`
     const compact = try db.serializeToBytesCompact(gpa);
     defer gpa.free(compact);
     var loaded = try RepoDb.deserializeFromBytes(gpa, compact);
     defer loaded.deinit();
     try std.testing.expectEqual(@as(i64, 1731096000), loaded.commits.items[c1].timestamp_sec);
+    try std.testing.expectEqual(@as(i16, -480), loaded.commits.items[c1].tz_offset_min);
 
     const stream = try git_interop.emitFastExportStream(gpa, &db);
     defer gpa.free(stream);
+    try std.testing.expect(std.mem.indexOf(u8, stream, "1731096000 -0800\n") != null);
     var git_loaded = try RepoDb.initNew(gpa, "/tmp/wt-git-ts");
     defer git_loaded.deinit();
     try git_interop.importFastExportStream(gpa, &git_loaded, stream);
     try std.testing.expectEqual(@as(i64, 1731096000), git_loaded.commits.items[c1].timestamp_sec);
+    try std.testing.expectEqual(@as(i16, -480), git_loaded.commits.items[c1].tz_offset_min);
 }
 
 test "Adversarial 35: .gitignore fallback, **/ recursive glob matching, and POSIX symlink (0o120000) materialization" {

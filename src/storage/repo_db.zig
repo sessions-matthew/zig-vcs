@@ -53,12 +53,28 @@ pub const CommitRecord = struct {
     author: []u8,
     message: []u8,
     timestamp_sec: i64 = 0,
+    tz_offset_min: i16 = 0,
 
     pub fn deinit(self: *CommitRecord, allocator: Allocator) void {
         allocator.free(self.author);
         allocator.free(self.message);
     }
 };
+
+const PosixTm = extern struct {
+    tm_sec: c_int,
+    tm_min: c_int,
+    tm_hour: c_int,
+    tm_mday: c_int,
+    tm_mon: c_int,
+    tm_year: c_int,
+    tm_wday: c_int,
+    tm_yday: c_int,
+    tm_isdst: c_int,
+    tm_gmtoff: c_long,
+    tm_zone: ?[*:0]const u8,
+};
+extern "c" fn localtime_r(timer: *const i64, result: *PosixTm) ?*PosixTm;
 
 /// Returns the current real-world Unix epoch timestamp in seconds via `clock_gettime(.REALTIME)`.
 pub fn currentUnixTimestampSec() i64 {
@@ -67,6 +83,87 @@ pub fn currentUnixTimestampSec() i64 {
         .SUCCESS => return @intCast(ts.sec),
         else => return 0,
     }
+}
+
+/// Returns the local timezone offset (in minutes east of UTC, e.g. `-480` for `-0800` PST)
+/// for `timestamp_sec` via `localtime_r` on Darwin/libc targets (or `0` on freestanding targets).
+pub fn localTzOffsetMinForTimestamp(timestamp_sec: i64) i16 {
+    const builtin = @import("builtin");
+    if (builtin.os.tag.isDarwin() or builtin.link_libc) {
+        var t: i64 = timestamp_sec;
+        var tm: PosixTm = undefined;
+        if (localtime_r(&t, &tm) != null) {
+            const off_min = @divTrunc(tm.tm_gmtoff, 60);
+            return @intCast(std.math.clamp(off_min, -14 * 60, 14 * 60));
+        }
+    }
+    return 0;
+}
+
+/// Returns the current local timezone offset in minutes east of UTC (e.g. `-480` for `-0800`).
+pub fn currentLocalTzOffsetMin() i16 {
+    return localTzOffsetMinForTimestamp(currentUnixTimestampSec());
+}
+
+/// Formats a timezone offset in minutes east of UTC as `±HHMM` (e.g., `"-0800"`, `"+0000"`, `"+0530"`).
+pub fn formatTzOffsetBuf(tz_offset_min: i16, buf: *[5]u8) []const u8 {
+    const sign: u8 = if (tz_offset_min < 0) '-' else '+';
+    const abs_min: u16 = @abs(tz_offset_min);
+    const hours: u16 = abs_min / 60;
+    const mins: u16 = abs_min % 60;
+    return std.fmt.bufPrint(buf, "{c}{d:0>2}{d:0>2}", .{ sign, @min(hours, 99), mins }) catch "+0000";
+}
+
+/// Parses an ISO-8601 / Git timezone offset string (`"-0800"`, `"+0530"`, `"-08:00"`, `"Z"`, `"UTC"`)
+/// into minutes east of UTC (`i16`).
+pub fn parseTzOffsetMin(s_raw: []const u8) ?i16 {
+    const s = std.mem.trim(u8, s_raw, " \t\r\n");
+    if (s.len == 0) return null;
+    if (std.mem.eql(u8, s, "Z") or std.mem.eql(u8, s, "UTC") or std.mem.eql(u8, s, "GMT")) {
+        return 0;
+    }
+    if (s[0] != '+' and s[0] != '-') return null;
+    const sign: i16 = if (s[0] == '-') -1 else 1;
+    const rest = s[1..];
+    if (rest.len == 4) {
+        const hh = std.fmt.parseInt(i16, rest[0..2], 10) catch return null;
+        const mm = std.fmt.parseInt(i16, rest[2..4], 10) catch return null;
+        if (hh > 14 or mm >= 60) return null;
+        return sign * (hh * 60 + mm);
+    } else if (rest.len == 5 and rest[2] == ':') {
+        const hh = std.fmt.parseInt(i16, rest[0..2], 10) catch return null;
+        const mm = std.fmt.parseInt(i16, rest[3..5], 10) catch return null;
+        if (hh > 14 or mm >= 60) return null;
+        return sign * (hh * 60 + mm);
+    }
+    return null;
+}
+
+/// Formats a Unix epoch timestamp (in seconds) with `tz_offset_min` (in minutes east of UTC)
+/// as `YYYY-MM-DD HH:MM:SS ±HHMM` (25 bytes, e.g. `"2026-11-10 17:14:43 -0800"`).
+pub fn formatTimestampWithOffsetBuf(timestamp_sec: i64, tz_offset_min: i16, buf: *[25]u8) []const u8 {
+    const adjusted: i64 = timestamp_sec + @as(i64, tz_offset_min) * 60;
+    const secs: u64 = if (adjusted > 0) @intCast(adjusted) else 0;
+    const epoch_secs = std.time.epoch.EpochSeconds{ .secs = secs };
+    const epoch_day = epoch_secs.getEpochDay();
+    const day_secs = epoch_secs.getDaySeconds();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    var tz_buf: [5]u8 = undefined;
+    const tz_str = formatTzOffsetBuf(tz_offset_min, &tz_buf);
+    return std.fmt.bufPrint(
+        buf,
+        "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} {s}",
+        .{
+            year_day.year,
+            month_day.month.numeric(),
+            @as(u8, month_day.day_index) + 1,
+            day_secs.getHoursIntoDay(),
+            day_secs.getMinutesIntoHour(),
+            day_secs.getSecondsIntoMinute(),
+            tz_str,
+        },
+    ) catch "1970-01-01 00:00:00 +0000";
 }
 
 /// Formats a Unix epoch timestamp (in seconds) as `YYYY-MM-DD HH:MM:SS UTC`.
@@ -424,7 +521,8 @@ pub const RepoDb = struct {
                 }
             }
         }
-        return self.appendCommitWithTimestamp(parent1, parent2, root_tree_id, author, message, ts);
+        const tz_min: i16 = if (cid == 0) 0 else localTzOffsetMinForTimestamp(ts);
+        return self.appendCommitWithTimestampAndTz(parent1, parent2, root_tree_id, author, message, ts, tz_min);
     }
 
     pub fn appendCommitWithTimestamp(
@@ -435,6 +533,21 @@ pub const RepoDb = struct {
         author: []const u8,
         message: []const u8,
         timestamp_sec: i64,
+    ) !CommitId {
+        const cid: CommitId = @intCast(self.commits.items.len);
+        const tz_min: i16 = if (cid == 0 or timestamp_sec <= 0) 0 else localTzOffsetMinForTimestamp(timestamp_sec);
+        return self.appendCommitWithTimestampAndTz(parent1, parent2, root_tree_id, author, message, timestamp_sec, tz_min);
+    }
+
+    pub fn appendCommitWithTimestampAndTz(
+        self: *RepoDb,
+        parent1: ?CommitId,
+        parent2: ?CommitId,
+        root_tree_id: TreeId,
+        author: []const u8,
+        message: []const u8,
+        timestamp_sec: i64,
+        tz_offset_min: i16,
     ) !CommitId {
         const cid: CommitId = @intCast(self.commits.items.len);
         const author_dup = try self.allocator.dupe(u8, author);
@@ -449,6 +562,7 @@ pub const RepoDb = struct {
             .author = author_dup,
             .message = message_dup,
             .timestamp_sec = timestamp_sec,
+            .tz_offset_min = tz_offset_min,
         });
         return cid;
     }
@@ -1893,17 +2007,23 @@ pub const RepoDb = struct {
             const m_copy = try self.allocator.dupe(u8, rec.message);
             defer self.allocator.free(m_copy);
 
-            const cascaded_ts: i64 = if (rec.timestamp_sec >= 1700000000 and rec.timestamp_sec < 1700010000)
+            const is_legacy_ts = (rec.timestamp_sec >= 1700000000 and rec.timestamp_sec < 1700010000);
+            const cascaded_ts: i64 = if (is_legacy_ts)
                 currentUnixTimestampSec()
             else
                 rec.timestamp_sec;
-            const new_cid = try self.appendCommitWithTimestamp(
+            const cascaded_tz: i16 = if (is_legacy_ts)
+                localTzOffsetMinForTimestamp(cascaded_ts)
+            else
+                rec.tz_offset_min;
+            const new_cid = try self.appendCommitWithTimestampAndTz(
                 mapped_p1 orelse rec.parent1,
                 mapped_p2 orelse rec.parent2,
                 cascaded_tid,
                 a_copy,
                 m_copy,
                 cascaded_ts,
+                cascaded_tz,
             );
             try remap.put(cid, new_cid);
         }
@@ -2606,8 +2726,8 @@ pub const RepoDb = struct {
             } else {
                 try out.print(allocator, " [root]{s}\n", .{conf_tag});
             }
-            var date_buf: [23]u8 = undefined;
-            const date_str = formatTimestampUtcBuf(c.timestamp_sec, &date_buf);
+            var date_buf: [25]u8 = undefined;
+            const date_str = formatTimestampWithOffsetBuf(c.timestamp_sec, c.tz_offset_min, &date_buf);
             try out.print(allocator, "| Author: {s}\n| Date:   {s}\n|     {s}\n|\n", .{ c.author, date_str, c.message });
         }
 
@@ -2666,10 +2786,13 @@ pub const RepoDb = struct {
                 }
             }
             if (found_local) |existing_cid| {
-                if (self.commits.items[existing_cid].timestamp_sec != remote.commits.items[rc_idx].timestamp_sec and
-                    remote.commits.items[rc_idx].timestamp_sec >= 1700010000)
-                {
-                    self.commits.items[existing_cid].timestamp_sec = remote.commits.items[rc_idx].timestamp_sec;
+                if (remote.commits.items[rc_idx].timestamp_sec >= 1700010000) {
+                    if (self.commits.items[existing_cid].timestamp_sec != remote.commits.items[rc_idx].timestamp_sec) {
+                        self.commits.items[existing_cid].timestamp_sec = remote.commits.items[rc_idx].timestamp_sec;
+                    }
+                    if (self.commits.items[existing_cid].tz_offset_min != remote.commits.items[rc_idx].tz_offset_min) {
+                        self.commits.items[existing_cid].tz_offset_min = remote.commits.items[rc_idx].tz_offset_min;
+                    }
                 }
                 remote_to_local_commit[rc_idx] = existing_cid;
             } else {
@@ -2677,13 +2800,14 @@ pub const RepoDb = struct {
                 const local_p1 = if (rc.parent1) |p1| remote_to_local_commit[p1] else null;
                 const local_p2 = if (rc.parent2) |p2| remote_to_local_commit[p2] else null;
                 const local_tid = remote_to_local_tree[rc.root_tree_id];
-                const new_cid = try self.appendCommitWithTimestamp(
+                const new_cid = try self.appendCommitWithTimestampAndTz(
                     local_p1,
                     local_p2,
                     local_tid,
                     rc.author,
                     rc.message,
                     rc.timestamp_sec,
+                    rc.tz_offset_min,
                 );
                 try local_hashes.append(self.allocator, self.computeCommitStructuralHash(new_cid));
                 remote_to_local_commit[rc_idx] = new_cid;
@@ -2904,8 +3028,8 @@ pub const RepoDb = struct {
 
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
-        var date_buf: [23]u8 = undefined;
-        const date_str = formatTimestampUtcBuf(c.timestamp_sec, &date_buf);
+        var date_buf: [25]u8 = undefined;
+        const date_str = formatTimestampWithOffsetBuf(c.timestamp_sec, c.tz_offset_min, &date_buf);
         try out.print(
             allocator,
             "commit c{d}\nAuthor: {s}\nDate:   {s} ({d})\n\n    {s}\n\n{s}",
@@ -3376,8 +3500,8 @@ pub const RepoDb = struct {
             } else {
                 try out.print(allocator, " [root]{s}\n", .{conf_tag});
             }
-            var date_buf: [23]u8 = undefined;
-            const date_str = formatTimestampUtcBuf(c.timestamp_sec, &date_buf);
+            var date_buf: [25]u8 = undefined;
+            const date_str = formatTimestampWithOffsetBuf(c.timestamp_sec, c.tz_offset_min, &date_buf);
             try out.print(allocator, "| Author: {s}\n| Date:   {s}\n|     {s}\n", .{ c.author, date_str, c.message });
             if (include_stat and c.id > 0) {
                 const parent_cid = c.parent1 orelse 0;
@@ -3791,8 +3915,8 @@ pub const RepoDb = struct {
             } else {
                 try out.print(allocator, " [root]{s}\n", .{conf_tag});
             }
-            var date_buf: [23]u8 = undefined;
-            const date_str = formatTimestampUtcBuf(c.timestamp_sec, &date_buf);
+            var date_buf: [25]u8 = undefined;
+            const date_str = formatTimestampWithOffsetBuf(c.timestamp_sec, c.tz_offset_min, &date_buf);
             try out.print(allocator, "| Author: {s}\n| Date:   {s}\n|     {s}\n", .{ c.author, date_str, c.message });
             if (include_stat and c.id > 0) {
                 const parent_cid = c.parent1 orelse 0;
@@ -4305,17 +4429,23 @@ pub const RepoDb = struct {
             const m_copy = try self.allocator.dupe(u8, rec.message);
             defer self.allocator.free(m_copy);
 
-            const cascaded_ts: i64 = if (rec.timestamp_sec >= 1700000000 and rec.timestamp_sec < 1700010000)
+            const is_legacy_ts = (rec.timestamp_sec >= 1700000000 and rec.timestamp_sec < 1700010000);
+            const cascaded_ts: i64 = if (is_legacy_ts)
                 currentUnixTimestampSec()
             else
                 rec.timestamp_sec;
-            const new_cid = try self.appendCommitWithTimestamp(
+            const cascaded_tz: i16 = if (is_legacy_ts)
+                localTzOffsetMinForTimestamp(cascaded_ts)
+            else
+                rec.tz_offset_min;
+            const new_cid = try self.appendCommitWithTimestampAndTz(
                 mapped_p1 orelse rec.parent1,
                 mapped_p2 orelse rec.parent2,
                 cascaded_tid,
                 a_copy,
                 m_copy,
                 cascaded_ts,
+                cascaded_tz,
             );
             try remap.put(cid, new_cid);
         }
@@ -4569,6 +4699,12 @@ pub const RepoDb = struct {
 
         // 7f. Config Key-Value Pairs
         try writeRemotesList(allocator, &out, self.configs.items);
+
+        // 7g. Commit Timezone Offsets (in minutes east of UTC)
+        try writeU32(allocator, &out, @intCast(self.commits.items.len));
+        for (self.commits.items) |c| {
+            try writeI16(allocator, &out, c.tz_offset_min);
+        }
 
         // 8. Full-file BLAKE3 checksum footer (32 bytes)
         const checksum = tree_sum.computeBlake3(out.items);
@@ -4850,6 +4986,12 @@ pub const RepoDb = struct {
 
         // 7f. Config Key-Value Pairs
         try writeRemotesList(allocator, &out, self.configs.items);
+
+        // 7g. Commit Timezone Offsets (in minutes east of UTC)
+        try writeU32(allocator, &out, @intCast(self.commits.items.len));
+        for (self.commits.items) |c| {
+            try writeI16(allocator, &out, c.tz_offset_min);
+        }
 
         // 8. Full-file BLAKE3 checksum footer (32 bytes)
         const checksum = tree_sum.computeBlake3(out.items);
@@ -5150,6 +5292,21 @@ pub const RepoDb = struct {
             try readRemotesList(allocator, payload, &pos, &db.configs);
         }
 
+        // 7g. Commit Timezone Offsets (if present; otherwise infer local timezone offset for non-root commits)
+        if (pos < payload.len) {
+            const num_tz = try readU32(payload, &pos);
+            if (num_tz != db.commits.items.len) return error.CorruptDatabase;
+            for (db.commits.items) |*c| {
+                c.tz_offset_min = try readI16(payload, &pos);
+            }
+        } else {
+            for (db.commits.items) |*c| {
+                if (c.id > 0 and c.timestamp_sec > 0) {
+                    c.tz_offset_min = localTzOffsetMinForTimestamp(c.timestamp_sec);
+                }
+            }
+        }
+
         // Ensure `stat_cache` is sorted by `(worktree_id, path)` for O(log F) binary search
         if (db.stat_cache.items.len > 1) {
             var is_sorted = true;
@@ -5394,6 +5551,12 @@ fn materializeUpsertView(
     };
 }
 
+fn writeI16(allocator: Allocator, out: *std.ArrayList(u8), v: i16) !void {
+    var buf: [2]u8 = undefined;
+    std.mem.writeInt(i16, &buf, v, .little);
+    try out.appendSlice(allocator, &buf);
+}
+
 fn writeU32(allocator: Allocator, out: *std.ArrayList(u8), v: u32) !void {
     var buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &buf, v, .little);
@@ -5516,6 +5679,13 @@ fn readRemotesList(
         errdefer allocator.free(path);
         try remotes.append(allocator, .{ .name = name, .path = path });
     }
+}
+
+fn readI16(data: []const u8, pos: *usize) !i16 {
+    if (data.len - pos.* < 2) return error.CorruptDatabase;
+    const v = std.mem.readInt(i16, data[pos.*..][0..2], .little);
+    pos.* += 2;
+    return v;
 }
 
 fn readU32(data: []const u8, pos: *usize) !u32 {

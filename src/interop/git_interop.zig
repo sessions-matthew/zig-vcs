@@ -90,10 +90,12 @@ pub fn emitFastExportStream(allocator: Allocator, db: *const RepoDb) ![]u8 {
         const c_mark = commit_mark_base + cid;
         const committer_ident = try formatFastExportIdentAlloc(allocator, c.author);
         defer allocator.free(committer_ident);
+        var tz_buf: [5]u8 = undefined;
+        const tz_str = repo_db.formatTzOffsetBuf(c.tz_offset_min, &tz_buf);
         const hdr = try std.fmt.allocPrint(
             allocator,
-            "commit refs/heads/main\nmark :{d}\ncommitter {s} {d} +0000\ndata {d}\n{s}\n",
-            .{ c_mark, committer_ident, c.timestamp_sec, c.message.len, c.message },
+            "commit refs/heads/main\nmark :{d}\ncommitter {s} {d} {s}\ndata {d}\n{s}\n",
+            .{ c_mark, committer_ident, c.timestamp_sec, tz_str, c.message.len, c.message },
         );
         defer allocator.free(hdr);
         try out.appendSlice(allocator, hdr);
@@ -259,6 +261,7 @@ pub fn importFastExportStream(allocator: Allocator, db: *RepoDb, stream: []const
             var mark_id: ?u64 = null;
             var author_name: []const u8 = "git-user";
             var commit_ts: i64 = repo_db.currentUnixTimestampSec();
+            var commit_tz: i16 = repo_db.currentLocalTzOffsetMin();
             var message: []const u8 = "";
             var parent1_cid: ?CommitId = null;
             var parent2_cid: ?CommitId = null;
@@ -280,11 +283,13 @@ pub fn importFastExportStream(allocator: Allocator, db: *RepoDb, stream: []const
                 } else if (std.mem.startsWith(u8, sub, "author ")) {
                     author_name = parsePersonName(sub["author ".len..]);
                     if (parsePersonTimestamp(sub["author ".len..])) |ts| commit_ts = ts;
+                    if (parsePersonTzOffsetMin(sub["author ".len..])) |tz| commit_tz = tz;
                 } else if (std.mem.startsWith(u8, sub, "committer ")) {
                     if (std.mem.eql(u8, author_name, "git-user")) {
                         author_name = parsePersonName(sub["committer ".len..]);
                     }
                     if (parsePersonTimestamp(sub["committer ".len..])) |ts| commit_ts = ts;
+                    if (parsePersonTzOffsetMin(sub["committer ".len..])) |tz| commit_tz = tz;
                 } else if (std.mem.startsWith(u8, sub, "data ")) {
                     const data_len = try std.fmt.parseInt(usize, sub["data ".len..], 10);
                     if (pos + data_len > stream.len) return error.UnexpectedEofInFastImport;
@@ -413,6 +418,7 @@ pub fn importFastExportStream(allocator: Allocator, db: *RepoDb, stream: []const
                 .author = author_dup,
                 .message = msg_dup,
                 .timestamp_sec = commit_ts,
+                .tz_offset_min = commit_tz,
             });
 
             if (mark_id) |m| try commit_marks.put(m, cid);
@@ -558,6 +564,18 @@ fn parsePersonTimestamp(s: []const u8) ?i64 {
         else
             after_gt;
         return std.fmt.parseInt(i64, ts_slice, 10) catch null;
+    }
+    return null;
+}
+
+fn parsePersonTzOffsetMin(s: []const u8) ?i16 {
+    if (std.mem.indexOfScalar(u8, s, '>')) |gt_idx| {
+        const after_gt = std.mem.trim(u8, s[gt_idx + 1 ..], " \t");
+        if (after_gt.len == 0) return null;
+        if (std.mem.indexOfScalar(u8, after_gt, ' ')) |sp| {
+            const tz_slice = std.mem.trim(u8, after_gt[sp + 1 ..], " \t");
+            return repo_db.parseTzOffsetMin(tz_slice);
+        }
     }
     return null;
 }
