@@ -72,6 +72,37 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    // Native `.dylib` Editor Plugin (`libzig_vcs.dylib`) for the Lightning Editor (`../editor`).
+    // Installed automatically into `zig-out/plugins/` and synced to `~/.lightning/plugins/` and `../editor/zig-out/plugins/`.
+    const plugin_lib = b.addLibrary(.{
+        .name = "zig_vcs",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/plugin/lightning_vcs_plugin.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "zig_vcs", .module = mod },
+            },
+        }),
+    });
+    const install_plugin = b.addInstallArtifact(plugin_lib, .{
+        .dest_dir = .{ .override = .{ .custom = "plugins" } },
+    });
+    b.getInstallStep().dependOn(&install_plugin.step);
+
+    const sync_plugin_cmd = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        "mkdir -p \"$HOME/.lightning/plugins\" && cp -f zig-out/plugins/libzig_vcs.dylib \"$HOME/.lightning/plugins/libzig_vcs.dylib\" && if [ -d ../editor/zig-out/plugins ]; then cp -f zig-out/plugins/libzig_vcs.dylib ../editor/zig-out/plugins/libzig_vcs.dylib; fi",
+    });
+    sync_plugin_cmd.step.dependOn(&install_plugin.step);
+    b.getInstallStep().dependOn(&sync_plugin_cmd.step);
+
+    const plugin_step = b.step("plugin", "Build and install libzig_vcs.dylib into zig-out/plugins/ and ~/.lightning/plugins/");
+    plugin_step.dependOn(&sync_plugin_cmd.step);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.
@@ -116,12 +147,18 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    const plugin_tests = b.addTest(.{
+        .root_module = plugin_lib.root_module,
+    });
+    const run_plugin_tests = b.addRunArtifact(plugin_tests);
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_plugin_tests.step);
 
     // Non-installed developer verification, fuzzing & benchmark executable (`zig build prove|fuzz|bench|profile`).
     // Keeps test/verification harnesses out of the installed `zig_vcs` CLI binary.
