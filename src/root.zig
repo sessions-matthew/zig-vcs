@@ -20,6 +20,7 @@ pub const perf_profiler = @import("testing/perf_profiler.zig");
 pub const cli_e2e_tests = @import("testing/cli_e2e_tests.zig");
 pub const git_interop = @import("interop/git_interop.zig");
 pub const cli = @import("cli.zig");
+pub const editor_plugin = @import("plugin/editor_plugin.zig");
 
 test {
     std.testing.refAllDecls(@This());
