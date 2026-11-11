@@ -2987,16 +2987,26 @@ pub const RepoDb = struct {
         self.worktrees.items[wt_id].is_dirty = (new_tid != head_tid);
     }
 
-    /// Inspect a commit or a file at a revision (`zig-vcs show [rev[:path]]`):
+    /// Inspect a commit or a file at a revision (`zig-vcs show [rev[:path]] [path_filter]`):
     /// - If `spec` contains `:` (`<rev>:<path>`), returns the exact file content (or algebraic
     ///   conflict summary) at `<path>` in `<rev>`.
     /// - Otherwise, returns the commit metadata header (`commit`, `Author`, `Timestamp`, message)
-    ///   followed by the unified diff against its first parent.
+    ///   followed by the unified diff against its first parent (optionally filtered to `path_filter_opt`).
     pub fn showRevision(
         self: *const RepoDb,
         allocator: Allocator,
         wt_id: WorktreeId,
         spec: []const u8,
+    ) ![]u8 {
+        return self.showRevisionFiltered(allocator, wt_id, spec, null);
+    }
+
+    pub fn showRevisionFiltered(
+        self: *const RepoDb,
+        allocator: Allocator,
+        wt_id: WorktreeId,
+        spec: []const u8,
+        path_filter_opt: ?[]const u8,
     ) ![]u8 {
         if (std.mem.indexOfScalar(u8, spec, ':')) |colon_idx| {
             const rev_part = if (colon_idx == 0) "HEAD" else spec[0..colon_idx];
@@ -3023,7 +3033,7 @@ pub const RepoDb = struct {
         const diff_txt = if (cid == 0)
             try allocator.dupe(u8, "")
         else
-            try self.diffTreesUnified(allocator, parent_tid, c.root_tree_id);
+            try self.diffTreesUnifiedFiltered(allocator, parent_tid, c.root_tree_id, path_filter_opt);
         defer allocator.free(diff_txt);
 
         var out: std.ArrayList(u8) = .empty;
@@ -3515,8 +3525,7 @@ pub const RepoDb = struct {
         return out.toOwnedSlice(allocator);
     }
 
-    fn appendJsonEscaped(allocator: Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
-        try out.append(allocator, '"');
+    fn appendJsonEscapedInner(allocator: Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
         for (s) |ch| {
             switch (ch) {
                 '"' => try out.appendSlice(allocator, "\\\""),
@@ -3533,6 +3542,11 @@ pub const RepoDb = struct {
                 },
             }
         }
+    }
+
+    fn appendJsonEscaped(allocator: Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+        try out.append(allocator, '"');
+        try appendJsonEscapedInner(allocator, out, s);
         try out.append(allocator, '"');
     }
 
@@ -3777,9 +3791,60 @@ pub const RepoDb = struct {
             try appendJsonEscaped(allocator, &out, c.message);
             try out.print(
                 allocator,
-                ",\"timestamp\":{d},\"has_conflicts\":{s}}}",
+                ",\"timestamp\":{d},\"has_conflicts\":{s},\"files\":[",
                 .{ c.timestamp_sec, if (tree.hasConflicts()) "true" else "false" },
             );
+            if (c.id > 0) {
+                const parent_cid = c.parent1 orelse 0;
+                const parent_tid = self.commits.items[parent_cid].root_tree_id;
+                const old_items = self.trees.items[parent_tid].entries.items;
+                const new_items = tree.entries.items;
+                var i_old: usize = 0;
+                var i_new: usize = 0;
+                var file_emitted: usize = 0;
+                while ((i_old < old_items.len or i_new < new_items.len) and file_emitted < 16) {
+                    const ord: std.math.Order = if (i_old < old_items.len and i_new < new_items.len)
+                        std.mem.order(u8, old_items[i_old].path, new_items[i_new].path)
+                    else if (i_old < old_items.len)
+                        .lt
+                    else
+                        .gt;
+                    switch (ord) {
+                        .lt => {
+                            if (file_emitted > 0) try out.append(allocator, ',');
+                            file_emitted += 1;
+                            try out.appendSlice(allocator, "\"D:");
+                            try appendJsonEscapedInner(allocator, &out, old_items[i_old].path);
+                            try out.append(allocator, '"');
+                            i_old += 1;
+                        },
+                        .gt => {
+                            if (file_emitted > 0) try out.append(allocator, ',');
+                            file_emitted += 1;
+                            const st_ch: u8 = if (new_items[i_new].sum.isConflicted()) 'U' else 'A';
+                            try out.print(allocator, "\"{c}:", .{st_ch});
+                            try appendJsonEscapedInner(allocator, &out, new_items[i_new].path);
+                            try out.append(allocator, '"');
+                            i_new += 1;
+                        },
+                        .eq => {
+                            const oe = old_items[i_old];
+                            const ne = new_items[i_new];
+                            i_old += 1;
+                            i_new += 1;
+                            if (!oe.sum.eql(ne.sum) or oe.mode != ne.mode) {
+                                if (file_emitted > 0) try out.append(allocator, ',');
+                                file_emitted += 1;
+                                const st_ch: u8 = if (ne.sum.isConflicted()) 'U' else 'M';
+                                try out.print(allocator, "\"{c}:", .{st_ch});
+                                try appendJsonEscapedInner(allocator, &out, ne.path);
+                                try out.append(allocator, '"');
+                            }
+                        },
+                    }
+                }
+            }
+            try out.appendSlice(allocator, "]}");
         }
         try out.appendSlice(allocator, "]}\n");
         return out.toOwnedSlice(allocator);
@@ -3987,9 +4052,60 @@ pub const RepoDb = struct {
             try appendJsonEscaped(allocator, &out, c.message);
             try out.print(
                 allocator,
-                ",\"timestamp\":{d},\"has_conflicts\":{s}}}",
+                ",\"timestamp\":{d},\"has_conflicts\":{s},\"files\":[",
                 .{ c.timestamp_sec, if (tree.hasConflicts()) "true" else "false" },
             );
+            if (c.id > 0) {
+                const parent_cid = c.parent1 orelse 0;
+                const parent_tid = self.commits.items[parent_cid].root_tree_id;
+                const old_items = self.trees.items[parent_tid].entries.items;
+                const new_items = tree.entries.items;
+                var i_old: usize = 0;
+                var i_new: usize = 0;
+                var file_emitted: usize = 0;
+                while ((i_old < old_items.len or i_new < new_items.len) and file_emitted < 16) {
+                    const ord: std.math.Order = if (i_old < old_items.len and i_new < new_items.len)
+                        std.mem.order(u8, old_items[i_old].path, new_items[i_new].path)
+                    else if (i_old < old_items.len)
+                        .lt
+                    else
+                        .gt;
+                    switch (ord) {
+                        .lt => {
+                            if (file_emitted > 0) try out.append(allocator, ',');
+                            file_emitted += 1;
+                            try out.appendSlice(allocator, "\"D:");
+                            try appendJsonEscapedInner(allocator, &out, old_items[i_old].path);
+                            try out.append(allocator, '"');
+                            i_old += 1;
+                        },
+                        .gt => {
+                            if (file_emitted > 0) try out.append(allocator, ',');
+                            file_emitted += 1;
+                            const st_ch: u8 = if (new_items[i_new].sum.isConflicted()) 'U' else 'A';
+                            try out.print(allocator, "\"{c}:", .{st_ch});
+                            try appendJsonEscapedInner(allocator, &out, new_items[i_new].path);
+                            try out.append(allocator, '"');
+                            i_new += 1;
+                        },
+                        .eq => {
+                            const oe = old_items[i_old];
+                            const ne = new_items[i_new];
+                            i_old += 1;
+                            i_new += 1;
+                            if (!oe.sum.eql(ne.sum) or oe.mode != ne.mode) {
+                                if (file_emitted > 0) try out.append(allocator, ',');
+                                file_emitted += 1;
+                                const st_ch: u8 = if (ne.sum.isConflicted()) 'U' else 'M';
+                                try out.print(allocator, "\"{c}:", .{st_ch});
+                                try appendJsonEscapedInner(allocator, &out, ne.path);
+                                try out.append(allocator, '"');
+                            }
+                        },
+                    }
+                }
+            }
+            try out.appendSlice(allocator, "]}");
         }
         try out.appendSlice(allocator, "]}\n");
         return out.toOwnedSlice(allocator);

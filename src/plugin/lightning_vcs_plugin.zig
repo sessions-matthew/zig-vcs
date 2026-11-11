@@ -361,6 +361,13 @@ pub const CachedBranchItem = struct {
     is_current: bool = false,
 };
 
+pub const MaxSelectedCommitFiles = 14;
+
+pub const CachedCommitFileItem = struct {
+    path: InlineString(80) = .{},
+    status: ep.FileChangeStatus = .modified,
+};
+
 pub const CachedCommitItem = struct {
     id: u64 = 0,
     parent1: u64 = 0,
@@ -371,6 +378,7 @@ pub const CachedCommitItem = struct {
     subject: InlineString(64) = .{},
     has_conflicts: bool = false,
     is_locked_git: bool = false,
+    files_changed_count: u16 = 0,
 };
 
 pub const CachedOplogItem = struct {
@@ -445,10 +453,13 @@ pub const ZigVcsPluginState = struct {
     toast_from_branch: InlineString(32) = .{},
     toast_banner: InlineString(96) = .{},
 
-    // Commit history + Refinement 3b (Immutable lock + Cascade dry-run)
+    // Commit history + Refinement 3b (Immutable lock + Cascade dry-run + Expandable per-commit files)
     commits: [MaxTrackedCommits]CachedCommitItem = @splat(.{}),
     commit_count: usize = 0,
     selected_commit_id: u64 = 0,
+    selected_commit_files: [MaxSelectedCommitFiles]CachedCommitFileItem = @splat(.{}),
+    selected_commit_file_count: usize = 0,
+    selected_git_commit_idx: usize = 0,
     unlock_immutable_rewrite: bool = false,
     cascade_preview_active: bool = false,
     cascade_preview_commit: u64 = 0,
@@ -671,6 +682,85 @@ fn statusBadgeText(status: ep.FileChangeStatus) []const u8 {
     };
 }
 
+fn countAndPopulateCommitFiles(
+    db: *const repo_db.RepoDb,
+    cid: usize,
+    out_files: ?*[MaxSelectedCommitFiles]CachedCommitFileItem,
+    out_count: ?*usize,
+) u16 {
+    if (out_count) |oc| oc.* = 0;
+    if (cid == 0 or cid >= db.commits.items.len) return 0;
+
+    const c = db.commits.items[cid];
+    const parent_cid = c.parent1 orelse 0;
+    const parent_tid = db.commits.items[parent_cid].root_tree_id;
+    const old_items = db.trees.items[parent_tid].entries.items;
+    const new_items = db.trees.items[c.root_tree_id].entries.items;
+
+    var i_old: usize = 0;
+    var i_new: usize = 0;
+    var total_changed: u16 = 0;
+
+    while (i_old < old_items.len or i_new < new_items.len) {
+        const ord: std.math.Order = if (i_old < old_items.len and i_new < new_items.len)
+            std.mem.order(u8, old_items[i_old].path, new_items[i_new].path)
+        else if (i_old < old_items.len)
+            .lt
+        else
+            .gt;
+
+        switch (ord) {
+            .lt => {
+                if (out_files) |files| {
+                    if (out_count) |oc| {
+                        if (oc.* < MaxSelectedCommitFiles) {
+                            files[oc.*] = .{ .status = .deleted };
+                            files[oc.*].path.set(old_items[i_old].path);
+                            oc.* += 1;
+                        }
+                    }
+                }
+                total_changed +|= 1;
+                i_old += 1;
+            },
+            .gt => {
+                const is_conf = new_items[i_new].sum.isConflicted();
+                if (out_files) |files| {
+                    if (out_count) |oc| {
+                        if (oc.* < MaxSelectedCommitFiles) {
+                            files[oc.*] = .{ .status = if (is_conf) .conflicted else .added };
+                            files[oc.*].path.set(new_items[i_new].path);
+                            oc.* += 1;
+                        }
+                    }
+                }
+                total_changed +|= 1;
+                i_new += 1;
+            },
+            .eq => {
+                const oe = old_items[i_old];
+                const ne = new_items[i_new];
+                i_old += 1;
+                i_new += 1;
+                if (!oe.sum.eql(ne.sum) or oe.mode != ne.mode) {
+                    const is_conf = ne.sum.isConflicted();
+                    if (out_files) |files| {
+                        if (out_count) |oc| {
+                            if (oc.* < MaxSelectedCommitFiles) {
+                                files[oc.*] = .{ .status = if (is_conf) .conflicted else .modified };
+                                files[oc.*].path.set(ne.path);
+                                oc.* += 1;
+                            }
+                        }
+                    }
+                    total_changed +|= 1;
+                }
+            },
+        }
+    }
+    return total_changed;
+}
+
 fn refreshFromRepoDb(st: *ZigVcsPluginState, force_sync_disk: bool) void {
     const io = getIo();
     const gpa = std.heap.c_allocator;
@@ -876,11 +966,26 @@ fn refreshFromRepoDb(st: *ZigVcsPluginState, force_sync_disk: bool) void {
             .tz_offset_min = c.tz_offset_min,
             .has_conflicts = db.trees.items[c.root_tree_id].hasConflicts(),
             .is_locked_git = (st.git_synced_max_commit > 0 and c_idx <= st.git_synced_max_commit and c_idx > 0),
+            .files_changed_count = countAndPopulateCommitFiles(&db, c_idx, null, null),
         };
         ci.author.set(c.author);
         const first_line = if (std.mem.indexOfScalar(u8, c.message, '\n')) |nl| c.message[0..nl] else c.message;
         ci.subject.set(first_line);
         st.commit_count += 1;
+    }
+
+    if (!st.initialized and st.selected_commit_id == 0 and br.head_commit > 0) {
+        st.selected_commit_id = br.head_commit;
+    }
+    if (st.selected_commit_id > 0) {
+        _ = countAndPopulateCommitFiles(
+            &db,
+            @intCast(st.selected_commit_id),
+            &st.selected_commit_files,
+            &st.selected_commit_file_count,
+        );
+    } else {
+        st.selected_commit_file_count = 0;
     }
 
     // Populate Oplog footer & recent entries (Refinement 3a)
@@ -1175,6 +1280,13 @@ fn performPreviewAmendCascade(st: *ZigVcsPluginState, target_cid: u64) void {
     const wt_id = ws_ctx.wt_id;
     _ = materializer.syncWorktreeFromDisk(gpa, io, &db, wt_id, ws_ctx.worktree_dir) catch {};
 
+    _ = countAndPopulateCommitFiles(
+        &db,
+        @intCast(target_cid),
+        &st.selected_commit_files,
+        &st.selected_commit_file_count,
+    );
+
     const max_pushed: ?repo_db.CommitId = if (st.git_synced_max_commit > 0) @intCast(st.git_synced_max_commit) else null;
     var dry_run = ep.previewAmendCascadeDryRun(gpa, &db, wt_id, @intCast(target_cid), max_pushed) catch return;
     defer dry_run.deinit(gpa);
@@ -1334,6 +1446,7 @@ fn applyPendingMutations(ctx: *Ctx, st: *ZigVcsPluginState) void {
             const cid = st.pending_u64;
             if (st.selected_commit_id == cid) {
                 st.selected_commit_id = 0;
+                st.selected_commit_file_count = 0;
                 st.cascade_preview_active = false;
             } else {
                 st.selected_commit_id = cid;
@@ -1478,6 +1591,11 @@ fn onCommand(host: *anyopaque, api: *const EditorHostApiV1, cmd_id_abi: AbiSlice
         st.files[1].line_checked[2] = true;
 
         st.selected_commit_id = st.head_commit;
+        st.selected_commit_file_count = 2;
+        st.selected_commit_files[0] = .{ .status = .modified };
+        st.selected_commit_files[0].path.set("src/plugin/lightning_vcs_plugin.zig");
+        st.selected_commit_files[1] = .{ .status = .modified };
+        st.selected_commit_files[1].path.set("src/storage/repo_db.zig");
         st.cascade_preview_active = true;
         st.cascade_preview_commit = st.head_commit;
         st.cascade_impacts_count = 2;
@@ -1768,9 +1886,9 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
     ctx.divider();
 
     // ========================================================================
-    // Commit Graph (`log`) + Immutable Lock Glyphs + Amend Cascade Dry-Run
+    // Commit Graph (`log`) + Per-File Commit Diffs + Immutable Lock + Cascade
     // ========================================================================
-    ctx.sectionLabel("COMMIT DAG (CLICK FOR DIFF & CASCADE)");
+    ctx.sectionLabel("COMMIT DAG (CLICK COMMIT FOR PER-FILE DIFFS)");
 
     for (st.commits[0..st.commit_count], 0..) |c, c_i| {
         ctx.pushId(ctx.fmt("cm_{d}", .{c_i}));
@@ -1780,24 +1898,72 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
         const conflict_suffix = if (c.has_conflicts) " ⚡" else "";
         const rail = if (c.parent2 > 0) "├─● " else if (c.id == st.head_commit) "◉─ " else "│ ● ";
         const lbl = ctx.fmt("{s}{s}c{d}{s}  {s}", .{ rail, lock_prefix, c.id, conflict_suffix, c.subject.slice() });
-        const meta = ctx.fmt("{s}", .{tz_str});
+        const meta = if (c.files_changed_count > 0)
+            ctx.fmt("{d}f · {s}", .{ c.files_changed_count, tz_str })
+        else
+            ctx.fmt("{s}", .{tz_str});
         const is_sel = (st.selected_commit_id == c.id);
 
         const row = ctx.listItemAction(
             lbl,
             meta,
-            if (c.id == st.head_commit) "@" else "●",
+            if (is_sel) "▾" else if (c.id == st.head_commit) "@" else "▸",
             if (c.has_conflicts) AccentAmber else if (c.id == st.head_commit) AccentEmerald else AccentNone,
             is_sel,
-            "Diff",
+            "All Diff",
         );
-        if (row.clicked or row.action_clicked) {
+        if (row.action_clicked) {
             ctx.api.open_git_diff(ctx.host, AbiSlice.fromZig(""), AbiSlice.fromZig(ctx.fmt("c{d}", .{c.id})), false, false);
+            if (!is_sel) {
+                st.schedule(&ctx, .select_commit, c_i, 0, c.id);
+            }
+        } else if (row.clicked) {
             st.schedule(&ctx, .select_commit, c_i, 0, c.id);
         }
 
-        // Refinement 3b: Cascade Dry-Run Preview & Immutable Commit Lock Guard
+        // Expanded Per-File Diffs + Cascade Dry-Run Preview & Immutable Commit Lock Guard
         if (is_sel and c.id > 0) {
+            if (st.selected_commit_file_count == 0) {
+                ctx.mutedLabel("    (No file tree changes in this commit)");
+            } else {
+                for (st.selected_commit_files[0..st.selected_commit_file_count], 0..) |cf, cf_i| {
+                    ctx.pushId(ctx.fmt("cmf_{d}", .{cf_i}));
+                    const cf_accent: u8 = switch (cf.status) {
+                        .conflicted => AccentAmber,
+                        .added => AccentEmerald,
+                        .deleted => AccentCrimson,
+                        .modified => AccentAmber,
+                    };
+                    const cf_row = ctx.listItemAction2(
+                        ctx.fmt("  {s}", .{cf.path.slice()}),
+                        statusBadgeText(cf.status),
+                        "↳",
+                        cf_accent,
+                        false,
+                        "Diff",
+                        "Split",
+                    );
+                    if (cf_row.clicked or cf_row.action_clicked) {
+                        ctx.api.open_git_diff(
+                            ctx.host,
+                            AbiSlice.fromZig(cf.path.slice()),
+                            AbiSlice.fromZig(ctx.fmt("c{d}", .{c.id})),
+                            false,
+                            false,
+                        );
+                    } else if (cf_row.secondary_action_clicked) {
+                        ctx.api.open_git_diff(
+                            ctx.host,
+                            AbiSlice.fromZig(cf.path.slice()),
+                            AbiSlice.fromZig(ctx.fmt("c{d}", .{c.id})),
+                            false,
+                            true,
+                        );
+                    }
+                    ctx.popId();
+                }
+            }
+
             if (st.cascade_preview_active and st.cascade_preview_commit == c.id) {
                 const status_badge = if (st.cascade_new_conflicts == 0)
                     "✓ Clean Cascade"
@@ -1911,6 +2077,60 @@ fn renderGitCompatibilityView(ctx: *Ctx, st: *ZigVcsPluginState) void {
                 ctx.api.open_git_diff(ctx.host, f.path, AbiSlice.fromZig(""), f.staged, false);
             }
             ctx.popId();
+        }
+    }
+
+    if (snap.commits_ptr) |commits_ptr| {
+        const commits = commits_ptr[0..snap.commit_count];
+        if (commits.len > 0) {
+            ctx.divider();
+            ctx.sectionLabel("GIT COMMITS (CLICK FOR PER-FILE DIFFS)");
+            for (commits, 0..) |gc, c_i| {
+                ctx.pushId(ctx.fmt("git_cm_{d}", .{c_i}));
+                const is_sel = (st.selected_git_commit_idx == c_i);
+                const lbl = ctx.fmt("{s}  {s}", .{ gc.hash.toZig(), gc.subject.toZig() });
+                const meta = ctx.fmt("{d}f · {s}", .{ gc.files_changed, gc.rel_time.toZig() });
+                const row = ctx.listItemAction(
+                    lbl,
+                    meta,
+                    if (is_sel) "▾" else "▸",
+                    if (c_i == 0) AccentEmerald else AccentNone,
+                    is_sel,
+                    "All Diff",
+                );
+                if (row.action_clicked) {
+                    ctx.api.open_git_diff(ctx.host, AbiSlice.fromZig(""), gc.hash, false, false);
+                    st.selected_git_commit_idx = c_i;
+                } else if (row.clicked) {
+                    st.selected_git_commit_idx = if (is_sel and c_i > 0) 0 else c_i;
+                }
+
+                if (is_sel) {
+                    if (gc.files_ptr) |c_files_ptr| {
+                        const c_files = c_files_ptr[0..gc.file_count];
+                        for (c_files, 0..) |cf, cf_i| {
+                            ctx.pushId(ctx.fmt("git_cmf_{d}", .{cf_i}));
+                            var st_buf: [2]u8 = .{ cf.status, 0 };
+                            const cf_row = ctx.listItemAction2(
+                                ctx.fmt("  {s}", .{cf.path.toZig()}),
+                                st_buf[0..1],
+                                "↳",
+                                AccentAmber,
+                                false,
+                                "Diff",
+                                "Split",
+                            );
+                            if (cf_row.clicked or cf_row.action_clicked) {
+                                ctx.api.open_git_diff(ctx.host, cf.path, gc.hash, false, false);
+                            } else if (cf_row.secondary_action_clicked) {
+                                ctx.api.open_git_diff(ctx.host, cf.path, gc.hash, false, true);
+                            }
+                            ctx.popId();
+                        }
+                    }
+                }
+                ctx.popId();
+            }
         }
     }
 }

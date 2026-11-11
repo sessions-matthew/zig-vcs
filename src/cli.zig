@@ -1126,19 +1126,29 @@ pub fn executeCommandInDir(
         }
     } else if (std.mem.eql(u8, subcmd, "show")) {
         var spec: []const u8 = "HEAD";
+        var has_spec = false;
+        var path_filter: ?[]const u8 = null;
+        var after_dashdash = false;
         var color_opt: ?bool = null;
         while (args_iter.next()) |arg| {
-            if (parseColorFlag(arg)) |cval| {
+            if (after_dashdash) {
+                path_filter = arg;
+            } else if (std.mem.eql(u8, arg, "--")) {
+                after_dashdash = true;
+            } else if (parseColorFlag(arg)) |cval| {
                 color_opt = cval;
-            } else {
+            } else if (!has_spec) {
                 spec = arg;
+                has_spec = true;
+            } else {
+                path_filter = arg;
             }
         }
         var ctx = try materializer.resolveWorkspaceContext(gpa, io, workspace_dir);
         defer ctx.deinit(gpa);
         var db = try repo_db.RepoDb.loadFromFile(gpa, io, ctx.db_path);
         defer db.deinit();
-        const out = try db.showRevision(gpa, ctx.wt_id, spec);
+        const out = try db.showRevisionFiltered(gpa, ctx.wt_id, spec, path_filter);
         defer gpa.free(out);
         if (std.mem.indexOfScalar(u8, spec, ':') == null and resolveUseColor(&db, color_opt)) {
             try writeColorizedUnifiedDiff(out, stdout);
