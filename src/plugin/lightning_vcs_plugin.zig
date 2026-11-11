@@ -1431,6 +1431,63 @@ fn onCommand(host: *anyopaque, api: *const EditorHostApiV1, cmd_id_abi: AbiSlice
     } else if (std.mem.eql(u8, cmd, "zig_vcs.toggle_math")) {
         st.math_mode = !st.math_mode;
         ctx.setNotice(if (st.math_mode) "zig-vcs: Enabled Z[A_bot] Math Mode" else "zig-vcs: Switched to Human-First Provenance Labels");
+    } else if (std.mem.eql(u8, cmd, "zig_vcs.demo_rich_state")) {
+        st.math_mode = true;
+        st.show_branches_dropdown = true;
+        st.branch_count = 2;
+        st.branches[0] = .{ .head_commit = 34, .has_draft = false, .is_current = true };
+        st.branches[0].name.set("main");
+        st.branches[1] = .{ .head_commit = 31, .has_draft = true, .is_current = false };
+        st.branches[1].name.set("feat/ui-panel");
+
+        st.toast_visible = true;
+        st.toast_from_branch.set("feat/ui-panel");
+        st.toast_banner.set("Shelved 2 file(s) on feat/ui-panel • Bring Changes Here?");
+
+        st.file_count = 2;
+        st.files[0] = .{
+            .status = .conflicted,
+            .checked = true,
+            .has_conflict = true,
+            .expanded_hunks = false,
+            .line_count = 1,
+        };
+        st.files[0].path.set("src/algebra/diff3_anchors.zig");
+        st.files[0].keep_left_label.set("Keep main (c34)");
+        st.files[0].take_right_label.set("Take feat/ui (c31)");
+        st.files[0].math_badge.set("Z[A_bot]: +1*Ours(b8f1) +1*Theirs(9a04) -1*Base");
+        st.files[0].ours_summary.set("+4 -1 vs Base");
+        st.files[0].theirs_summary.set("+6 -2 vs Base");
+
+        st.files[1] = .{
+            .status = .modified,
+            .checked = true,
+            .has_conflict = false,
+            .expanded_hunks = true,
+            .line_count = 3,
+        };
+        st.files[1].path.set("src/plugin/lightning_vcs_plugin.zig");
+        st.files[1].line_numbers[0] = 42;
+        st.files[1].line_previews[0].set("pub fn renderVcsGraphViewer(uic: *Ctx)");
+        st.files[1].line_checked[0] = true;
+        st.files[1].line_numbers[1] = 87;
+        st.files[1].line_previews[1].set("std.debug.print(\"WIP trace\\n\", .{});");
+        st.files[1].line_checked[1] = false;
+        st.files[1].line_numbers[2] = 104;
+        st.files[1].line_previews[2].set("ui.assignSwimlanes(&state.vcs_graph);");
+        st.files[1].line_checked[2] = true;
+
+        st.selected_commit_id = st.head_commit;
+        st.cascade_preview_active = true;
+        st.cascade_preview_commit = st.head_commit;
+        st.cascade_impacts_count = 2;
+        st.cascade_new_conflicts = 0;
+
+        st.oplog_expanded = true;
+        st.oplog_preview_active = true;
+        st.oplog_preview_index = 31;
+        st.oplog_preview_op.set("switch-branch");
+        st.oplog_preview_diff.set("+2 ~1 -0 vs working tree");
     } else if (std.mem.eql(u8, cmd, "zig_vcs.fsck")) {
         ctx.api.run_terminal_command(ctx.host, AbiSlice.fromZig("./zig-out/bin/zig_vcs fsck"));
     }
