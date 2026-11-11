@@ -40,10 +40,8 @@ pub const AbiSlice = extern struct {
     }
 
     pub fn toZig(self: AbiSlice) []const u8 {
-        if (self.ptr) |p| {
-            return p[0..self.len];
-        }
-        return &.{};
+        const p = self.ptr orelse return &.{};
+        return p[0..self.len];
     }
 };
 
@@ -53,19 +51,33 @@ pub const PluginCapabilities = packed struct(u32) {
     sidebar_panel: bool = false,
     bottom_panel: bool = false,
     status_bar: bool = false,
+    editor_overlay: bool = false,
     background_poller: bool = false,
-    _reserved: u26 = 0,
+    _reserved: u25 = 0,
 };
 
 pub const PluginSidebarIcon = enum(u8) {
     none = 0,
     debug = 1,
     cpu = 2,
-    board = 3,
-    waveform = 4,
-    git = 5,
-    plugins = 6,
+    waveform = 3,
+    git = 4,
+    plugins = 5,
+    board = 6,
     pdf = 7,
+};
+
+pub const PluginToolbarIcon = enum(u8) {
+    play = 0,
+    pause = 1,
+    step_over = 2,
+    step_into = 3,
+    step_out = 4,
+    restart = 5,
+    stop = 6,
+    gear = 7,
+    debug_console = 8,
+    breakpoint = 9,
 };
 
 pub const PluginManifestV1 = extern struct {
@@ -87,9 +99,9 @@ pub const BufferInfoV1 = extern struct {
     line_count: u32 = 1,
     cursor_offset: usize = 0,
     selection_anchor: usize = 0,
-    cursor_line: u32 = 1,
-    cursor_col: u32 = 1,
-    edit_version: u64 = 0,
+    cursor_line: u32 = 0,
+    cursor_col: u32 = 0,
+    edit_version: u32 = 0,
     is_dirty: bool = false,
 };
 
@@ -103,7 +115,7 @@ pub const BufferEditEventV1 = extern struct {
     start_offset: usize = 0,
     old_end_offset: usize = 0,
     new_end_offset: usize = 0,
-    edit_version: u64 = 0,
+    edit_version: u32 = 0,
 };
 
 pub const CompletionItemV1 = extern struct {
@@ -114,9 +126,26 @@ pub const CompletionItemV1 = extern struct {
     replace_prefix_len: u16 = 0,
 };
 
+pub const BreakpointV1 = extern struct {
+    file_path: AbiSlice = .{},
+    line: u32 = 1,
+    enabled: bool = true,
+    hit_count: u32 = 0,
+};
+
+pub const GitActionV1 = enum(u32) {
+    stage_path = 0,
+    unstage_path = 1,
+    stage_all = 2,
+    unstage_all = 3,
+    discard_path = 4,
+    commit = 5,
+    refresh = 6,
+};
+
 pub const GitFileStatusV1 = extern struct {
     path: AbiSlice = .{},
-    status: u8 = ' ',
+    status: u8 = 'M',
     staged: bool = false,
     unstaged: bool = false,
     untracked: bool = false,
@@ -140,25 +169,33 @@ pub const GitStatusSnapshotV1 = extern struct {
     commit_count: usize = 0,
 };
 
-pub const GitActionV1 = enum(u8) {
-    stage_path = 0,
-    unstage_path = 1,
-    stage_all = 2,
-    unstage_all = 3,
-    discard_path = 4,
-    commit = 5,
-    refresh = 6,
+pub const TextFieldResultFlags = packed struct(u8) {
+    changed: bool = false,
+    submitted: bool = false,
+    escaped: bool = false,
+    focused: bool = false,
+    _reserved: u4 = 0,
 };
 
-pub const BreakpointV1 = extern struct {
-    file_path: AbiSlice = .{},
-    line: u32 = 1,
-    enabled: bool = true,
-    hit_count: u32 = 0,
+pub const SectionHeaderResultFlags = packed struct(u8) {
+    expanded: bool = false,
+    action_clicked: bool = false,
+    right_clicked: bool = false,
+    _reserved: u5 = 0,
+};
+
+pub const ListItemResultFlags = packed struct(u8) {
+    clicked: bool = false,
+    action_clicked: bool = false,
+    secondary_action_clicked: bool = false,
+    right_clicked: bool = false,
+    _reserved: u4 = 0,
 };
 
 pub const PluginUiApiV1 = extern struct {
     get_pass: *const fn (host: *anyopaque) callconv(.c) u8,
+
+    // Layout Containers
     begin_column: *const fn (host: *anyopaque, w: f32, h: f32, pad: f32, gap: f32) callconv(.c) void,
     begin_row: *const fn (host: *anyopaque, w: f32, h: f32, pad: f32, gap: f32) callconv(.c) void,
     end_box: *const fn (host: *anyopaque) callconv(.c) void,
@@ -168,28 +205,61 @@ pub const PluginUiApiV1 = extern struct {
     divider: *const fn (host: *anyopaque) callconv(.c) void,
     push_id: *const fn (host: *anyopaque, id: AbiSlice) callconv(.c) void,
     pop_id: *const fn (host: *anyopaque) callconv(.c) void,
+
+    // Cached Text & Interactive Widgets
     label: *const fn (host: *anyopaque, text: AbiSlice, style: u8) callconv(.c) void,
     button: *const fn (host: *anyopaque, label: AbiSlice, w: f32, h: f32) callconv(.c) bool,
-    toolbar_icon_btn: *const fn (host: *anyopaque, id: AbiSlice, icon: u8, active: bool, enabled: bool, w: f32, h: f32, icon_color_rgba: u32) callconv(.c) bool,
+    toolbar_icon_btn: *const fn (host: *anyopaque, label: AbiSlice, icon: PluginToolbarIcon, w: f32, h: f32, enabled: bool) callconv(.c) bool,
+    dropdown_select: *const fn (host: *anyopaque, label: AbiSlice, display_text: AbiSlice, w: f32, h: f32, active_border: bool) callconv(.c) bool,
+    reserve_dropdown_overlay: *const fn (host: *anyopaque, height: f32) callconv(.c) bool,
+    begin_dropdown_overlay: *const fn (host: *anyopaque) callconv(.c) void,
+    end_dropdown_overlay: *const fn (host: *anyopaque) callconv(.c) void,
+    collapsible_section: *const fn (host: *anyopaque, label: AbiSlice, expanded: *bool, badge_text: AbiSlice) callconv(.c) bool,
+    collapsible_section_with_action: *const fn (host: *anyopaque, label: AbiSlice, expanded: *bool, badge_text: AbiSlice, action_label: AbiSlice) callconv(.c) u8,
+    tree_folder_node: *const fn (host: *anyopaque, label: AbiSlice, indent_level: u8, expanded: *bool, meta: AbiSlice) callconv(.c) bool,
     chip: *const fn (host: *anyopaque, label: AbiSlice, active: bool) callconv(.c) bool,
     list_item: *const fn (host: *anyopaque, label: AbiSlice, meta: AbiSlice, selected: bool) callconv(.c) bool,
-    list_item_action: *const fn (host: *anyopaque, label: AbiSlice, meta: AbiSlice, icon_text: AbiSlice, icon_color_rgba: u32, selected: bool, action_label: AbiSlice, out_action_clicked: *bool, out_secondary_clicked: *bool) callconv(.c) bool,
-    progress_bar: *const fn (host: *anyopaque, fraction: f32, h: f32) callconv(.c) void,
-    text_field: *const fn (host: *anyopaque, id: AbiSlice, buf_ptr: [*]u8, buf_cap: usize, len_inout: *usize, placeholder: AbiSlice) callconv(.c) bool,
+    list_item_ex: *const fn (
+        host: *anyopaque,
+        label: AbiSlice,
+        meta: AbiSlice,
+        icon_text: AbiSlice,
+        action_label: AbiSlice,
+        secondary_action_label: AbiSlice,
+        indent_level: u8,
+        selected: bool,
+        accent_kind: u8,
+    ) callconv(.c) u8,
+    text_field: *const fn (host: *anyopaque, id: AbiSlice, buf_ptr: [*]u8, len_ptr: *usize, cap: usize, placeholder: AbiSlice) callconv(.c) u8,
+    text_area: *const fn (host: *anyopaque, id: AbiSlice, buf_ptr: [*]u8, len_ptr: *usize, cap: usize, placeholder: AbiSlice, height: f32) callconv(.c) u8,
+    markdown: *const fn (host: *anyopaque, source: AbiSlice) callconv(.c) void,
+    waveform_view: *const fn (host: *anyopaque, id: AbiSlice, vcd_source: AbiSlice, height: f32) callconv(.c) void,
+    pdf_view: *const fn (host: *anyopaque, id: AbiSlice, file_path: AbiSlice, raw_bytes: AbiSlice, height: f32) callconv(.c) void,
 };
 
 pub const EditorHostApiV1 = extern struct {
     abi_version: u32 = EDITOR_PLUGIN_ABI_VERSION,
+
+    // 1. Per-Frame Arena & Persistent Scoped State (`dlclose`-safe)
     frame_alloc: *const fn (host: *anyopaque, size: usize, alignment_log2: u8) callconv(.c) ?[*]u8,
-    use_state_raw: *const fn (host: *anyopaque, key: AbiSlice, size: usize, alignment_log2: u8, type_hash: u64, initialized_out: *bool) callconv(.c) [*]u8,
+    use_state_raw: *const fn (
+        host: *anyopaque,
+        key: AbiSlice,
+        size: usize,
+        alignment_log2: u8,
+        type_hash: u64,
+        initialized_out: *bool,
+    ) callconv(.c) [*]u8,
+
+    // 2. Zero-Copy Buffer Inspection & Atomic Mutation
     get_active_buffer: *const fn (host: *anyopaque, out: *BufferInfoV1) callconv(.c) bool,
     get_line_range: *const fn (host: *anyopaque, buffer_id: u32, line_idx: u32) callconv(.c) LineRangeV1,
     offset_to_line_col: *const fn (host: *anyopaque, buffer_id: u32, offset: usize, line_out: *u32, col_out: *u32) callconv(.c) void,
     replace_buffer_range: *const fn (host: *anyopaque, buffer_id: u32, start: usize, end: usize, new_text: AbiSlice) callconv(.c) bool,
     set_cursor_and_scroll: *const fn (host: *anyopaque, buffer_id: u32, cursor: usize, anchor: usize) callconv(.c) void,
+
+    // 3. Command Palette, Autocomplete Popup, Preview Buffers, Status Notice & Async Wakeup
     register_command: *const fn (host: *anyopaque, cmd_id: AbiSlice, title: AbiSlice, category: AbiSlice, shortcut_hint: AbiSlice) callconv(.c) bool,
-    set_status_notice: *const fn (host: *anyopaque, msg: AbiSlice) callconv(.c) void,
-    request_continuous_redraw: *const fn (host: *anyopaque) callconv(.c) void,
     set_completions: *const fn (host: *anyopaque, buffer_id: u32, cursor_offset: usize, items_ptr: ?[*]const CompletionItemV1, item_count: usize) callconv(.c) void,
     open_waveform_preview: *const fn (host: *anyopaque, vcd_source: AbiSlice, split_to_side: bool) callconv(.c) void,
     open_pdf_preview: *const fn (host: *anyopaque, file_path: AbiSlice, raw_bytes: AbiSlice, split_to_side: bool) callconv(.c) void,
@@ -200,10 +270,16 @@ pub const EditorHostApiV1 = extern struct {
     git_action: *const fn (host: *anyopaque, action: GitActionV1, path_or_msg: AbiSlice) callconv(.c) bool,
     run_terminal_command: *const fn (host: *anyopaque, cmd: AbiSlice) callconv(.c) void,
     toggle_bottom_panel: *const fn (host: *anyopaque) callconv(.c) void,
+    set_status_notice: *const fn (host: *anyopaque, msg: AbiSlice) callconv(.c) void,
+    request_continuous_redraw: *const fn (host: *anyopaque) callconv(.c) void,
+
+    // 4. Shared Breakpoints & Active Debugger Execution Line
     toggle_breakpoint: *const fn (host: *anyopaque, file_path: AbiSlice, line_1based: u32) callconv(.c) bool,
     clear_breakpoints: *const fn (host: *anyopaque) callconv(.c) void,
     get_breakpoints: *const fn (host: *anyopaque, out_ptr: ?[*]BreakpointV1, max_count: usize) callconv(.c) usize,
     set_debug_location: *const fn (host: *anyopaque, active: bool, paused: bool, file_path: AbiSlice, line_1based: u32, jump_to_line: bool) callconv(.c) void,
+
+    // 5. Two-Phase Declarative UI Toolkit Bridge
     ui: *const PluginUiApiV1,
 };
 
@@ -303,6 +379,33 @@ pub const CachedOplogItem = struct {
     head_commit: u64 = 0,
 };
 
+pub const PendingActionKind = enum(u8) {
+    none = 0,
+    sync_refresh = 1,
+    toggle_branches_dropdown = 2,
+    toggle_git_mode = 3,
+    toggle_math_mode = 4,
+    dismiss_toast = 5,
+    bring_shelved_draft = 6,
+    switch_branch = 7,
+    commit_checked = 8,
+    toggle_file_checked = 9,
+    toggle_file_hunks = 10,
+    toggle_line_checked = 11,
+    resolve_conflict_ours = 12,
+    resolve_conflict_theirs = 13,
+    select_commit = 14,
+    unlock_immutable = 15,
+    amend_commit = 16,
+    backout_commit = 17,
+    undo_op = 18,
+    redo_op = 19,
+    toggle_oplog_expanded = 20,
+    preview_oplog_jump = 21,
+    restore_oplog = 22,
+    cancel_oplog_preview = 23,
+};
+
 pub const ZigVcsPluginState = struct {
     initialized: bool = false,
     has_zvcs_db: bool = false,
@@ -310,6 +413,12 @@ pub const ZigVcsPluginState = struct {
     show_git_fallback_mode: bool = false,
     math_mode: bool = false,
     last_db_mtime_ns: i96 = -1,
+
+    // Deferred action queue (guarantees Pass.input == Pass.paint layout determinism)
+    pending_kind: PendingActionKind = .none,
+    pending_index: usize = 0,
+    pending_sub_index: usize = 0,
+    pending_u64: u64 = 0,
 
     // Active workspace summary
     current_branch: InlineString(32) = .{},
@@ -358,6 +467,14 @@ pub const ZigVcsPluginState = struct {
 
     // Status feedback banner
     last_action_status: InlineString(96) = .{},
+
+    pub fn schedule(self: *ZigVcsPluginState, ctx: *Ctx, kind: PendingActionKind, idx: usize, sub_idx: usize, val_u64: u64) void {
+        self.pending_kind = kind;
+        self.pending_index = idx;
+        self.pending_sub_index = sub_idx;
+        self.pending_u64 = val_u64;
+        ctx.api.request_continuous_redraw(ctx.host);
+    }
 };
 
 comptime {
@@ -373,6 +490,10 @@ comptime {
 const Ctx = struct {
     host: *anyopaque,
     api: *const EditorHostApiV1,
+
+    fn isInputPass(self: *Ctx) bool {
+        return self.api.ui.get_pass(self.host) == 0;
+    }
 
     fn alloc(self: *Ctx) std.mem.Allocator {
         return .{
@@ -399,10 +520,10 @@ const Ctx = struct {
         var initialized = false;
         const raw = self.api.use_state_raw(
             self.host,
-            AbiSlice.fromZig("zvcs_state_v2"),
+            AbiSlice.fromZig("zvcs_state_v3"),
             @sizeOf(ZigVcsPluginState),
             @ctz(@as(usize, @alignOf(ZigVcsPluginState))),
-            0x5A564353_55495F33,
+            0x5A564353_55495F34,
             &initialized,
         );
         const ptr: *ZigVcsPluginState = @ptrCast(@alignCast(raw));
@@ -465,35 +586,34 @@ const Ctx = struct {
         lbl: []const u8,
         meta: []const u8,
         icon_text: []const u8,
-        icon_col: u32,
+        accent_kind: u8,
         selected: bool,
         action_label: []const u8,
-    ) struct { clicked: bool, action_clicked: bool, secondary_clicked: bool } {
-        var act = false;
-        var sec = false;
-        const clicked = self.api.ui.list_item_action(
+    ) ListItemResultFlags {
+        const bits = self.api.ui.list_item_ex(
             self.host,
             AbiSlice.fromZig(lbl),
             AbiSlice.fromZig(meta),
             AbiSlice.fromZig(icon_text),
-            icon_col,
-            selected,
             AbiSlice.fromZig(action_label),
-            &act,
-            &sec,
+            AbiSlice.fromZig(""),
+            0,
+            selected,
+            accent_kind,
         );
-        return .{ .clicked = clicked, .action_clicked = act, .secondary_clicked = sec };
+        return @bitCast(bits);
     }
 
-    fn textField(self: *Ctx, id: []const u8, str: anytype, placeholder: []const u8) bool {
-        return self.api.ui.text_field(
+    fn textField(self: *Ctx, id: []const u8, str: anytype, placeholder: []const u8) TextFieldResultFlags {
+        const bits = self.api.ui.text_field(
             self.host,
             AbiSlice.fromZig(id),
             &str.buf,
-            @TypeOf(str.*).Capacity,
             &str.len,
+            @TypeOf(str.*).Capacity,
             AbiSlice.fromZig(placeholder),
         );
+        return @bitCast(bits);
     }
 
     fn setNotice(self: *Ctx, msg: []const u8) void {
@@ -1104,11 +1224,122 @@ fn performBackoutCommit(ctx: *Ctx, st: *ZigVcsPluginState, target_cid: u64) void
 // 5. Sidebar, Status Bar & Lifecycle Hook Implementations
 // ============================================================================
 
-const ColEmerald: u32 = 0xFF34D399;
-const ColAmber: u32 = 0xFFFBBF24;
-const ColCrimson: u32 = 0xFFF87171;
-const ColCyan: u32 = 0xFF38BDF8;
-const ColViolet: u32 = 0xFFA855F7;
+const AccentNone: u8 = 0;
+const AccentEmerald: u8 = 1;
+const AccentAmber: u8 = 2;
+const AccentCrimson: u8 = 3;
+
+fn applyPendingMutations(ctx: *Ctx, st: *ZigVcsPluginState) void {
+    const kind = st.pending_kind;
+    if (kind == .none) return;
+    st.pending_kind = .none;
+
+    switch (kind) {
+        .none => {},
+        .sync_refresh => {
+            ctx.api.sync_workspace_git(ctx.host, true, false);
+            refreshFromRepoDb(st, true);
+        },
+        .toggle_branches_dropdown => {
+            st.show_branches_dropdown = !st.show_branches_dropdown;
+        },
+        .toggle_git_mode => {
+            st.show_git_fallback_mode = !st.show_git_fallback_mode;
+        },
+        .toggle_math_mode => {
+            st.math_mode = !st.math_mode;
+        },
+        .dismiss_toast => {
+            st.toast_visible = false;
+        },
+        .bring_shelved_draft => {
+            performBringShelvedDraftHere(ctx, st);
+        },
+        .switch_branch => {
+            if (st.pending_index < st.branch_count) {
+                var br_name: [32]u8 = undefined;
+                const src = st.branches[st.pending_index].name.slice();
+                @memcpy(br_name[0..src.len], src);
+                performSwitchBranch(ctx, st, br_name[0..src.len]);
+            }
+        },
+        .commit_checked => {
+            performCommitChecked(ctx, st);
+        },
+        .toggle_file_checked => {
+            if (st.pending_index < st.file_count) {
+                st.files[st.pending_index].checked = !st.files[st.pending_index].checked;
+            }
+        },
+        .toggle_file_hunks => {
+            if (st.pending_index < st.file_count) {
+                st.files[st.pending_index].expanded_hunks = !st.files[st.pending_index].expanded_hunks;
+            }
+        },
+        .toggle_line_checked => {
+            if (st.pending_index < st.file_count) {
+                const f = &st.files[st.pending_index];
+                if (st.pending_sub_index < f.line_count) {
+                    f.line_checked[st.pending_sub_index] = !f.line_checked[st.pending_sub_index];
+                }
+            }
+        },
+        .resolve_conflict_ours => {
+            if (st.pending_index < st.file_count) {
+                var p_buf: [80]u8 = undefined;
+                const src = st.files[st.pending_index].path.slice();
+                @memcpy(p_buf[0..src.len], src);
+                performResolveConflictSide(ctx, st, p_buf[0..src.len], true);
+            }
+        },
+        .resolve_conflict_theirs => {
+            if (st.pending_index < st.file_count) {
+                var p_buf: [80]u8 = undefined;
+                const src = st.files[st.pending_index].path.slice();
+                @memcpy(p_buf[0..src.len], src);
+                performResolveConflictSide(ctx, st, p_buf[0..src.len], false);
+            }
+        },
+        .select_commit => {
+            const cid = st.pending_u64;
+            if (st.selected_commit_id == cid) {
+                st.selected_commit_id = 0;
+                st.cascade_preview_active = false;
+            } else {
+                st.selected_commit_id = cid;
+                performPreviewAmendCascade(st, cid);
+            }
+        },
+        .unlock_immutable => {
+            st.unlock_immutable_rewrite = true;
+        },
+        .amend_commit => {
+            performAmendCommit(ctx, st, st.pending_u64);
+        },
+        .backout_commit => {
+            performBackoutCommit(ctx, st, st.pending_u64);
+        },
+        .undo_op => {
+            performUndoRedo(ctx, st, true);
+        },
+        .redo_op => {
+            performUndoRedo(ctx, st, false);
+        },
+        .toggle_oplog_expanded => {
+            st.oplog_expanded = !st.oplog_expanded;
+            refreshFromRepoDb(st, false);
+        },
+        .preview_oplog_jump => {
+            performPreviewOplogJump(st, st.pending_index);
+        },
+        .restore_oplog => {
+            performRestoreOplog(ctx, st, st.pending_index);
+        },
+        .cancel_oplog_preview => {
+            st.oplog_preview_active = false;
+        },
+    }
+}
 
 fn registerCommands(ctx: *Ctx) void {
     _ = ctx.api.register_command(ctx.host, AbiSlice.fromZig("zig_vcs.refresh"), AbiSlice.fromZig("zig-vcs: Sync & Refresh Repository State"), AbiSlice.fromZig("zig-vcs"), AbiSlice.fromZig("ZVCS"));
@@ -1165,7 +1396,9 @@ fn onCommand(host: *anyopaque, api: *const EditorHostApiV1, cmd_id_abi: AbiSlice
 fn renderStatusBar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) void {
     var ctx = Ctx{ .host = host, .api = api };
     const st = ctx.state();
-    if (!st.initialized) refreshFromRepoDb(st, false);
+    if (ctx.isInputPass() and !st.initialized) {
+        refreshFromRepoDb(st, false);
+    }
     if (!st.has_zvcs_db) return;
 
     var conflict_count: usize = 0;
@@ -1181,33 +1414,35 @@ fn renderStatusBar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) v
         ctx.fmt("zvcs: @{s} (c{d} · ✓)##zvcs_sb", .{ st.current_branch.slice(), st.head_commit });
 
     if (ctx.chip(chip_lbl, conflict_count == 0)) {
-        refreshFromRepoDb(st, true);
+        st.schedule(&ctx, .sync_refresh, 0, 0, 0);
     }
 }
 
 fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) void {
     var ctx = Ctx{ .host = host, .api = api };
     const st = ctx.state();
-    refreshFromRepoDb(st, false);
+    if (ctx.isInputPass()) {
+        applyPendingMutations(&ctx, st);
+        refreshFromRepoDb(st, false);
+    }
 
     // Top Header Bar + Provider Mode / Math Mode Toggles
     ctx.beginRow(28, 6);
     if (st.has_zvcs_db) {
         if (ctx.chip(ctx.fmt("@{s} (c{d})##zvcs_br_chip", .{ st.current_branch.slice(), st.head_commit }), !st.show_git_fallback_mode)) {
-            st.show_branches_dropdown = !st.show_branches_dropdown;
+            st.schedule(&ctx, .toggle_branches_dropdown, 0, 0, 0);
         }
     }
     if (st.has_git_dir) {
         if (ctx.chip(if (st.show_git_fallback_mode) "Mode: Git ⇄##zvcs_git_mode" else "ZVCS ⇄ Git##zvcs_git_mode", st.show_git_fallback_mode)) {
-            st.show_git_fallback_mode = !st.show_git_fallback_mode;
+            st.schedule(&ctx, .toggle_git_mode, 0, 0, 0);
         }
     }
     if (ctx.chip(if (st.math_mode) "Z[A_bot]##zvcs_math" else "Human Labels##zvcs_math", st.math_mode)) {
-        st.math_mode = !st.math_mode;
+        st.schedule(&ctx, .toggle_math_mode, 0, 0, 0);
     }
     if (ctx.button("Sync##zvcs_sync", 52, 24)) {
-        ctx.api.sync_workspace_git(ctx.host, true, false);
-        refreshFromRepoDb(st, true);
+        st.schedule(&ctx, .sync_refresh, 0, 0, 0);
     }
     ctx.endBox();
 
@@ -1241,10 +1476,10 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
         ctx.label(st.toast_banner.slice());
         ctx.beginRow(26, 6);
         if (ctx.button("Bring Changes Here (B+C-A)##zvcs_bring_draft", 190, 24)) {
-            performBringShelvedDraftHere(&ctx, st);
+            st.schedule(&ctx, .bring_shelved_draft, 0, 0, 0);
         }
         if (ctx.button("Keep Shelved##zvcs_dismiss_toast", 96, 24)) {
-            st.toast_visible = false;
+            st.schedule(&ctx, .dismiss_toast, 0, 0, 0);
         }
         ctx.endBox();
     }
@@ -1263,12 +1498,12 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
                 b.name.slice(),
                 meta,
                 if (b.is_current) "@" else " ",
-                if (b.is_current) ColEmerald else ColCyan,
+                if (b.is_current) AccentEmerald else AccentNone,
                 b.is_current,
                 if (b.is_current) "Active" else "Switch",
             );
             if ((row.clicked or row.action_clicked) and !b.is_current) {
-                performSwitchBranch(&ctx, st, b.name.slice());
+                st.schedule(&ctx, .switch_branch, b_i, 0, 0);
             }
             ctx.popId();
         }
@@ -1281,7 +1516,10 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
     // ========================================================================
     ctx.sectionLabel(ctx.fmt("WORKING CHANGES ({d}) — @{s}", .{ st.file_count, st.current_worktree.slice() }));
 
-    _ = ctx.textField("##zvcs_commit_msg", &st.commit_msg, "Commit message (no staging index needed)...");
+    const tf_res = ctx.textField("##zvcs_commit_msg", &st.commit_msg, "Commit message (no staging index needed)...");
+    if (tf_res.submitted) {
+        st.schedule(&ctx, .commit_checked, 0, 0, 0);
+    }
 
     // Compute Commit Button Guardrail State (Refinement 1a)
     var checked_total: usize = 0;
@@ -1302,7 +1540,7 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
     ctx.beginRow(28, 6);
     if (ctx.button(ctx.fmt("{s}##zvcs_commit_btn", .{btn_label}), 0, 26)) {
         if (checked_total > 0) {
-            performCommitChecked(&ctx, st);
+            st.schedule(&ctx, .commit_checked, 0, 0, 0);
         }
     }
     ctx.endBox();
@@ -1314,11 +1552,11 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
             ctx.pushId(ctx.fmt("wf_{d}", .{f_idx}));
             const check_glyph = if (f.checked) "[✓]" else "[ ]";
             const badge = statusBadgeText(f.status);
-            const icon_col: u32 = switch (f.status) {
-                .conflicted => ColAmber,
-                .added => ColEmerald,
-                .deleted => ColCrimson,
-                .modified => ColCyan,
+            const accent: u8 = switch (f.status) {
+                .conflicted => AccentAmber,
+                .added => AccentEmerald,
+                .deleted => AccentCrimson,
+                .modified => AccentAmber,
             };
             const item_lbl = ctx.fmt("{s} {s}", .{ check_glyph, f.path.slice() });
             const action_lbl = if (f.has_conflict)
@@ -1332,19 +1570,19 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
                 item_lbl,
                 badge,
                 if (f.has_conflict) "⚡" else "●",
-                icon_col,
+                accent,
                 f.checked,
                 action_lbl,
             );
             if (row.clicked) {
-                f.checked = !f.checked;
+                st.schedule(&ctx, .toggle_file_checked, f_idx, 0, 0);
             } else if (row.action_clicked) {
                 if (f.line_count > 1 or f.has_conflict) {
-                    f.expanded_hunks = !f.expanded_hunks;
+                    st.schedule(&ctx, .toggle_file_hunks, f_idx, 0, 0);
                 } else {
                     ctx.api.open_git_diff(ctx.host, AbiSlice.fromZig(f.path.slice()), AbiSlice.fromZig(""), false, false);
                 }
-            } else if (row.secondary_clicked) {
+            } else if (row.secondary_action_clicked) {
                 _ = ctx.api.open_file_path(ctx.host, AbiSlice.fromZig(f.path.slice()));
             }
 
@@ -1359,10 +1597,10 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
                 }));
                 ctx.beginRow(24, 6);
                 if (ctx.button(ctx.fmt("{s}##res_ours_{d}", .{ f.keep_left_label.slice(), f_idx }), 126, 22)) {
-                    performResolveConflictSide(&ctx, st, f.path.slice(), true);
+                    st.schedule(&ctx, .resolve_conflict_ours, f_idx, 0, 0);
                 }
                 if (ctx.button(ctx.fmt("{s}##res_theirs_{d}", .{ f.take_right_label.slice(), f_idx }), 126, 22)) {
-                    performResolveConflictSide(&ctx, st, f.path.slice(), false);
+                    st.schedule(&ctx, .resolve_conflict_theirs, f_idx, 0, 0);
                 }
                 ctx.endBox();
             }
@@ -1377,7 +1615,7 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
                         "line",
                         f.line_checked[l_i],
                     )) {
-                        f.line_checked[l_i] = !f.line_checked[l_i];
+                        st.schedule(&ctx, .toggle_line_checked, f_idx, l_i, 0);
                     }
                     ctx.popId();
                 }
@@ -1407,18 +1645,12 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
             lbl,
             meta,
             if (c.id == st.head_commit) "@" else "●",
-            if (c.has_conflicts) ColAmber else if (c.id == st.head_commit) ColEmerald else ColViolet,
+            if (c.has_conflicts) AccentAmber else if (c.id == st.head_commit) AccentEmerald else AccentNone,
             is_sel,
             "Inspect",
         );
         if (row.clicked or row.action_clicked) {
-            if (st.selected_commit_id == c.id) {
-                st.selected_commit_id = 0;
-                st.cascade_preview_active = false;
-            } else {
-                st.selected_commit_id = c.id;
-                performPreviewAmendCascade(st, c.id);
-            }
+            st.schedule(&ctx, .select_commit, c_i, 0, c.id);
         }
 
         // Refinement 3b: Cascade Dry-Run Preview & Immutable Commit Lock Guard
@@ -1437,19 +1669,19 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
                 ctx.beginRow(24, 6);
                 ctx.mutedLabel("  🔒 Pushed to Git");
                 if (ctx.button("Unlock Rewrite##zvcs_unlock", 104, 22)) {
-                    st.unlock_immutable_rewrite = true;
+                    st.schedule(&ctx, .unlock_immutable, 0, 0, 0);
                 }
                 if (ctx.button(ctx.fmt("Undo c{d} (B+C-A)##zvcs_backout", .{c.id}), 116, 22)) {
-                    performBackoutCommit(&ctx, st, c.id);
+                    st.schedule(&ctx, .backout_commit, 0, 0, c.id);
                 }
                 ctx.endBox();
             } else {
                 ctx.beginRow(24, 6);
                 if (ctx.button(ctx.fmt("Amend c{d} & Cascade##zvcs_amend", .{c.id}), 134, 22)) {
-                    performAmendCommit(&ctx, st, c.id);
+                    st.schedule(&ctx, .amend_commit, 0, 0, c.id);
                 }
                 if (ctx.button(ctx.fmt("Backout c{d}##zvcs_backout2", .{c.id}), 96, 22)) {
-                    performBackoutCommit(&ctx, st, c.id);
+                    st.schedule(&ctx, .backout_commit, 0, 0, c.id);
                 }
                 ctx.endBox();
             }
@@ -1466,14 +1698,13 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
 
     ctx.beginRow(26, 6);
     if (ctx.button("↶ Undo##zvcs_undo_btn", 68, 24)) {
-        performUndoRedo(&ctx, st, true);
+        st.schedule(&ctx, .undo_op, 0, 0, 0);
     }
     if (ctx.button("↷ Redo##zvcs_redo_btn", 68, 24)) {
-        performUndoRedo(&ctx, st, false);
+        st.schedule(&ctx, .redo_op, 0, 0, 0);
     }
     if (ctx.button(if (st.oplog_expanded) "Collapse ▾##zvcs_scrub" else "Scrub ▴##zvcs_scrub", 86, 24)) {
-        st.oplog_expanded = !st.oplog_expanded;
-        refreshFromRepoDb(st, false);
+        st.schedule(&ctx, .toggle_oplog_expanded, 0, 0, 0);
     }
     ctx.endBox();
 
@@ -1486,10 +1717,10 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
             }));
             ctx.beginRow(24, 6);
             if (ctx.button(ctx.fmt("Restore #{d} (Auto-Saves Buffers)##zvcs_oplog_restore", .{st.oplog_preview_index}), 200, 22)) {
-                performRestoreOplog(&ctx, st, st.oplog_preview_index);
+                st.schedule(&ctx, .restore_oplog, st.oplog_preview_index, 0, 0);
             }
             if (ctx.button("Cancel##zvcs_oplog_cancel", 64, 22)) {
-                st.oplog_preview_active = false;
+                st.schedule(&ctx, .cancel_oplog_preview, 0, 0, 0);
             }
             ctx.endBox();
         }
@@ -1500,7 +1731,7 @@ fn renderSidebar(host: *anyopaque, api: *const EditorHostApiV1) callconv(.c) voi
             const op_meta = ctx.fmt("c{d}", .{op.head_commit});
             const is_prev = st.oplog_preview_active and (st.oplog_preview_index == op.index);
             if (ctx.listItem(op_lbl, op_meta, is_prev)) {
-                performPreviewOplogJump(st, op.index);
+                st.schedule(&ctx, .preview_oplog_jump, op.index, 0, 0);
             }
             ctx.popId();
         }
@@ -1515,7 +1746,7 @@ fn renderGitCompatibilityView(ctx: *Ctx, st: *ZigVcsPluginState) void {
         ctx.beginRow(28, 6);
         if (ctx.button("Init .vcs/db.vcs##zvcs_init_btn", 130, 26)) {
             ctx.api.run_terminal_command(ctx.host, AbiSlice.fromZig("./zig-out/bin/zig_vcs init"));
-            refreshFromRepoDb(st, true);
+            st.schedule(ctx, .sync_refresh, 0, 0, 0);
         }
         ctx.endBox();
         ctx.divider();
